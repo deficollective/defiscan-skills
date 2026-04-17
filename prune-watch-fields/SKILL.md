@@ -88,6 +88,7 @@ These fields MUST be monitored. If any of these are already in `ignoreInWatchMod
 Fee parameters that admins can change are security-critical. These are rate/percentage settings, NOT running totals:
 - `fee`, `feeRate`, `performanceFee`, `managementFee`, `protocolFee`, `withdrawalFee`, `entryFee`, `exitFee`, `mintFee`, `redeemFee`, `flashLoanFee`
 - Any field matching `*Fee` or `*FeeRate` where the value is a small number (typically < 10000, representing basis points or percentage)
+- **Curve `admin_fee`** — this is a rate parameter (fraction of swap fees going to admin, scale 1e10), NOT an accumulator. Distinct from `admin_balances` (which IS the accumulator). Do NOT confuse the two.
 
 ### Tier 2: SAFE TO IGNORE (high confidence)
 
@@ -104,6 +105,7 @@ These fields change frequently but have no security implications.
 - `circulatingSupply`, `totalShares`, `totalStaked`, `totalLocked`, `totalMinted`
 - Fields starting with `total` when the value is a large number (> 10^12) and numeric
 - `getEntireSystemColl`, `getEntireSystemDebt` (Liquity-style)
+- `balances`, `admin_balances` (Curve/Vyper pool reserves and fee accumulators — arrays of large numbers)
 
 **Batch and block state (L2/rollup progression):**
 - `getTotalBatchesCommitted`, `getTotalBatchesExecuted`, `getTotalBatchesVerified`
@@ -118,6 +120,7 @@ These fields change frequently but have no security implications.
 **Timestamps reflecting state progression:**
 - `lastUpdate`, `lastAccrualTime`, `lastStakeBlock`, `lastFeeOperationTime`
 - Fields starting with `last` when value is a Unix timestamp (large number > 10^9)
+- Fields containing `_last_` or `_last` or ending with `_timestamp` when value is a Unix timestamp (e.g., `ma_last_time`, `last_prices_timestamp`)
 
 **Data sizes and lengths:**
 - Fields ending with `DataSize`, `Length`, `Size` (getter return values)
@@ -125,8 +128,10 @@ These fields change frequently but have no security implications.
 
 **Prices and oracle reads (change every block):**
 - `latestRoundData`, `latestAnswer`
-- Fields containing `Price` when the value is numeric (NOT when it's an address — that's an oracle reference)
+- Fields containing `Price` or `_price` or `price_` when the value is numeric (NOT when it's an address — that's an oracle reference)
 - `currentTick`, `sqrtPriceX96` (AMM price state)
+- Curve/Vyper pool price reads: `get_p`, `ema_price`, `last_price`, `price_oracle` (numeric value), `stored_rates`, `get_virtual_price`, `virtual_price`
+- Exchange rate readers: `getRate`, `exchangeRate` when value is a large ratio number (~10^18) — NOTE: these are *derived* reads from share/asset accounting, NOT admin-set rates
 
 **Game and dispute counters (OP Stack):**
 - `permissionedGamesTotal`, `gameCount`

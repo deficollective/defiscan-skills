@@ -47,6 +47,36 @@ Record every potentially useful URL you find.
 
 ---
 
+## Step 1.5: Save Protocol Logo
+
+*(Skip this step in audits-only mode)*
+
+**ICON_DIR** (relative to repo root): `packages/defiscan-frontend/public/protocols/`
+
+From the website fetched in Step 1, locate the protocol's logo and download it into `ICON_DIR` with filename `$0.svg` (preferred) or `$0.png` (fallback). Use `curl` via Bash.
+
+Search order on the page's HTML:
+1. `<link rel="icon" type="image/svg+xml" href="...">` — save as `$0.svg`
+2. `<link rel="apple-touch-icon" href="...">` — usually 180×180 PNG, save as `$0.png`
+3. `<meta property="og:image" content="...">` — save as `$0.png` (only if it clearly shows the protocol mark, not a generic banner)
+4. `/favicon.svg` or `/favicon.ico` at the site root — save as `$0.svg` if SVG, otherwise skip
+
+If the URL is relative, resolve it against the website origin. If nothing suitable is found, skip — the frontend has a default fallback. Do not convert formats; save whatever extension you downloaded (only `.svg` or `.png` are used by the frontend).
+
+### Resize PNG to 128×128
+
+After a `.png` is saved, resize it in place to 128×128 max. The frontend displays logos in a 48px container, so 128px covers retina without bloat (a 512px apple-touch-icon is ~25× too many bytes). SVGs scale natively — skip this step for `.svg` files.
+
+```bash
+pnpm dlx sharp-cli -i "$ICON_DIR/$0.png" -o "/tmp/resized-$0.png" \
+  resize 128 128 --fit inside --withoutEnlargement \
+  && mv "/tmp/resized-$0.png" "$ICON_DIR/$0.png"
+```
+
+If `sharp-cli` fails (network issue, first-time install), keep the raw file — oversized is better than missing.
+
+---
+
 ## Step 2: Web Search for Additional Resources
 
 *(Skip this step in audits-only mode)*
