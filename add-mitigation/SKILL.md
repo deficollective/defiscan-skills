@@ -96,6 +96,23 @@ Each mitigation is an object in the `mitigations` array:
 }
 ```
 
+#### Writing the `description` field
+
+The `description` is rendered directly in the public DeFiScan report UI (hover tooltip on the mitigation badge). It must read like a plain-English security explanation for a DeFi user, not a developer note.
+
+**NEVER mention in a description:**
+- Internal file names (`discovered.json`, `functions.json`, `config.jsonc`, `funds-data.json`)
+- Backend/monitoring plumbing terms (`fieldMeta`, `HIGH severity`, `ignoreInWatchMode`, "tracked at", "see the X field")
+- Discovery/handler jargon (`CallHandler`, `ignoreRelatives`, `proxyType`)
+- Editorial notes addressed to maintainers or future researchers
+
+**DO:**
+- Describe the constraint in terms of what the contract does (what limits apply, what trust assumptions exist, what the function can/cannot do)
+- Name contracts by their on-chain role ("the pool owner", "the governor") when it adds clarity; include the address only when a user might want to verify it on-chain
+- Quote concrete numbers (caps, delays, percentages) in user-readable units
+
+If you want to flag implementation details to researchers, put them in a commit message or a separate doc — **not** in the `description` field.
+
 #### Value modes
 
 Use the most specific mode available:

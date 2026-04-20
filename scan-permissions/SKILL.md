@@ -161,6 +161,7 @@ For each permissioned function, record:
 - **Multiple modifiers/checks in sequence with OR branching**: If a function checks `hasRole(ADMIN_ROLE) || hasRole(OPERATOR_ROLE)` → two ownerDefinitions for each role
 - **Fallthrough logic**: `if (msg.sender != fastCaller) { require(msg.sender == slowCaller) }` → two ownerDefinitions
 - **External ACL + direct check**: A function that allows both an ACL role AND a direct owner → include both paths
+- **Role admin (transitive grant via OZ AccessControl)**: For any `onlyRole(R)` function, the holders of `R`'s admin role can grant themselves `R` and then call the function — they are effectively also owners. Add the role admin's members as an additional ownerDefinition. By default OZ `AccessControl` makes `DEFAULT_ADMIN_ROLE` the admin of every role unless `_setRoleAdmin(R, X)` was called or the contract overrides `getRoleAdmin`. Verify via the `accessControl.<ROLE>.adminRole` field in discovered data, then add `$self.accessControl.<ADMIN_ROLE>.members` alongside `$self.accessControl.<ROLE>.members`. Chain further if the admin role itself has a non-self admin (rare — usually all roles resolve up to `DEFAULT_ADMIN_ROLE`). Skip this step only when `R`'s admin is `R` itself (self-admin roles have no transitive escalation path).
 
 Always express every independent caller as a separate entry in `ownerDefinitions`. Do NOT collapse them or report that "multi-caller functions couldn't be expressed" — the array format exists precisely for this.
 
@@ -183,10 +184,11 @@ This is the critical step. For each permissioned function identified in Step 2:
 
 From the source code, identify **every** storage variable or mechanism that grants access. A single function may have multiple independent callers. Collect them all — each becomes a separate `ownerDefinitions` entry. Examples:
 - `onlyOwner` modifier → `owner` state variable → one ownerDefinition
-- `onlyRole(MINTER_ROLE)` → OpenZeppelin AccessControl → one ownerDefinition
+- `onlyRole(MINTER_ROLE)` → OpenZeppelin AccessControl → **two** ownerDefinitions: `MINTER_ROLE` members AND the admin of `MINTER_ROLE` (who can grant it). Check `accessControl.MINTER_ROLE.adminRole` in discovered data; typically `DEFAULT_ADMIN_ROLE`.
 - `require(msg.sender == governance)` → `governance` state variable → one ownerDefinition
 - `require(msg.sender == owner || msg.sender == guardian)` → **two** ownerDefinitions: `owner` AND `guardian`
 - External ACL call → address field pointing to another contract → one ownerDefinition
+- `grantRole` / `revokeRole` → `onlyRole(getRoleAdmin(role))` — in the general case this is `DEFAULT_ADMIN_ROLE` since it's the admin of itself (self-admin, no further escalation) and the default admin of every other role
 
 ### 3b. Map to a path expression
 
