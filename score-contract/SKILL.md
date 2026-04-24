@@ -1,13 +1,13 @@
 ---
 name: score-contract
-description: Score all permissioned functions on a contract — assess fund impact (drain risk, token devaluation, yield reduction), set scores (critical/no-impact), and add on-chain mitigations. Combines impact analysis and mitigation detection into a single batch workflow.
+description: Score all permissioned functions on a contract — assess fund impact (drain risk, token devaluation, yield reduction), set scores (critical/no-impact), and add on-chain mitigations with impact caps. Combines impact analysis, containment classification, and on-chain-bounded cap derivation into a single batch workflow.
 ---
 
 # Score Contract
 
-Batch-analyze all permissioned functions on a contract: assess each function's potential impact on funds, score them, and find on-chain mitigations for impactful ones.
+Batch-analyze permissioned functions on a contract: triage by complexity, read source proportionately, classify containment, score, and wire mitigations with on-chain-bounded impact caps where the worst case is bounded by observable state.
 
-Uses **structured API data** (call graph, fund reachability, capital analysis) as the primary input. Falls back to deep source code tracing only when the call graph has unresolved external calls.
+API data (`/admins`, `/function-analysis`, `/dependencies`) is for **prioritization** — what reaches funds, at what scale. It is not the final verdict. Source-reading is mandatory, but it scales with ambiguity, not with function count: most functions resolve in seconds from signature + a glance at the body; only the minority with genuine ambiguity need a full storage-trace.
 
 ## Arguments
 
@@ -19,42 +19,34 @@ Uses **structured API data** (call graph, fund reachability, capital analysis) a
 ```
 
 - **project** — project folder name (e.g. `aerodrome`, `aave-v3`)
-- **contractAddress** — chain-prefixed contract address (e.g. `base:0xB630...`) or contract name (e.g. `CLGaugeFactory`). Add chain prefix if omitted.
-- **Multiple addresses** — pass several positional addresses, OR a single comma-separated list, to score a specific batch of contracts one after another. Same interactive confirmation as `--all --interactive`, but limited to the given list. Names and addresses may be mixed; normalize addresses by lowercasing when matching.
-- **--all --interactive** — score every contract with permissioned functions, one at a time, waiting for user confirmation after each.
+- **contractAddress** — chain-prefixed address (e.g. `base:0xB630...`) or contract name (e.g. `CLGaugeFactory`). Add chain prefix if omitted.
+- **Multiple addresses** — positional or comma-separated. Names and addresses may be mixed; normalize by lowercasing when matching.
+- **--all --interactive** — score every contract with unscored permissioned functions, one at a time, waiting for user confirmation after each.
 
-When a list of addresses is provided, use the `--all --interactive` loop (Phase 0 + Loop below) but build the contract queue from the supplied list instead of from all contracts with unscored functions. Preserve the input order.
+When a list is provided, use the `--all --interactive` loop but build the queue from the supplied list; preserve input order.
+
+---
 
 ## Instructions
 
 ### Phase 1: Fetch structured data
 
-Gather data from the API and disk. All API calls go to `localhost:2021`.
-
-**From API:**
+API (`localhost:2021`):
 
 ```bash
-# Admin-level function analysis with capital data (per-contract)
 curl -s "localhost:2021/api/projects/<project>/admins?contract=<address>"
-
-# Full function analysis with reachability and unresolved call counts
 curl -s "localhost:2021/api/projects/<project>/function-analysis"
+curl -s "localhost:2021/api/projects/<project>/dependencies"
 ```
 
-The `/admins` response provides per-function:
-- `directFundsUsd`, `directTokenValueUsd` — funds on the contract itself
-- `totalReachableFundsUsd`, `totalReachableTokenValueUsd` — funds on contracts reachable via call graph
-- `reachableContracts[]` — each with `contractName`, `calledFunctions[]`, `fundsUsd`, `viewOnlyPath`
-- `unresolvedCallsCount` — number of external calls the call graph couldn't resolve
+Disk:
+- `packages/config/src/projects/<project>/functions.json` — permissioned function list with current scores/mitigations
+- `packages/config/src/projects/<project>/discovered.json` — discovered fields, used for fieldRef caps
+- `packages/config/src/projects/<project>/call-graph-data.json` — resolved call-graph edges (needed for direct-caller detection and unresolved call details)
+- `packages/config/src/projects/<project>/funds-data.json` — token prices/decimals (for `unit: token` cap resolution)
+- `packages/config/src/projects/<project>/.flat/` — flattened source code (mandatory input, see Phase 2)
 
-The `/function-analysis` response provides the same reachability per function, plus `callPath[]` showing the shortest path to each reachable contract.
-
-**From disk:**
-
-- Read `packages/config/src/projects/<project>/functions.json` — permissioned function list with current scores/mitigations
-- Read `packages/config/src/projects/<project>/call-graph-data.json` — needed to get **details** of unresolved calls (the API only exposes the count; the on-disk data has `storageVariable`, `interfaceType`, `calledFunction` for calls without `resolvedAddress`)
-
-If the user provided a contract name instead of an address, resolve it by searching `functions.json` or `discovered.json` for the matching contract.
+Skip functions that already have a non-`unscored` score AND a non-empty `mitigations` array — they are fully reviewed. Mention the skipped count.
 
 **Output — Function List:**
 
@@ -71,147 +63,295 @@ PERMISSIONED FUNCTIONS (6):
   6. setSecondsPerLiq      no-impact   (skipped)        -
 ```
 
-Skip functions that already have BOTH a non-`unscored` score AND a `mitigations` array — they are fully reviewed. Mention how many were skipped and why.
+---
 
-Functions with a score but no mitigations, or with mitigations but `unscored`, should still be analyzed for the missing part.
+### Phase 2: Triage, then read source proportionately
 
-### Phase 2: Score functions (API-first, source-as-fallback)
+Reading source remains mandatory, but **not every function needs the same depth**. Most functions resolve in a glance; a minority need a real trace. The goal is to let cost scale with ambiguity, not with function count.
 
-For each remaining permissioned function, determine the score using one of two paths:
+#### Phase 2a — Load context once per contract
 
-#### Path A — Fully resolved (unresolvedCallsCount == 0)
+Before scoring any function on a contract, do this once:
 
-The call graph is complete. Use the structured API data:
+1. Read the contract's flattened source into working memory (typically one file under `.flat/<ContractName>/` or `.flat/<address>/`). Subsequent function analysis reads from memory, not fresh fetches.
+2. Scan for **shared bounds** — patterns that apply to multiple functions:
+   - A modifier gating many functions (`wait`, `onlyPoolConfigurator`, `whenNotPaused`).
+   - A constant cap used by several setters (`MAX_VALID_LTV`, `MAX_VALID_RESERVE_FACTOR`).
+   - A common guard shape (every setter bounded by `require(_x <= MAX)`).
+3. Note any contract-wide state flags that change fund semantics (`initialized`, `live`, `paused`, `triggered`).
 
-1. Check `reachableContracts[]` — which contracts can this function reach, do they hold funds?
-2. Check `viewOnlyPath` — is the path view-only (no state changes)?
-3. Check `directFundsUsd` / `totalReachableFundsUsd` / `totalTokenValueAtRisk`
+Resolve these once; reuse across all functions on this contract instead of re-deriving per function.
 
-If no reachable contracts with funds AND no direct funds AND no token value → likely `no-impact`.
+#### Phase 2b — Triage each function into a lane
 
-If funds are reachable through a non-view path → **temporal classification needed**. Read only the **terminal function** in the API-provided call path (the function on the fund-holding contract) to determine when/how the value is consumed. Classify as checkpoint/distribute, claim/withdraw, swap/trade, or governance/config (see temporal context below).
+Using the API data (`directFundsUsd`, `totalReachableFundsUsd`, `viewOnlyPath`, `impact.reachableContracts[]`), the owner path, the function signature, and a **single glance** at the function body, classify each function into one of three lanes:
 
-#### Path B — Unresolved calls (unresolvedCallsCount > 0)
+**Fast lane** — verdict is high-confidence from the signature, owner, and a one-line body read. No grep across `.flat/`, no Q2/Q3.
 
-The call graph has gaps. Print which calls are unresolved from `call-graph-data.json`:
+Typical fast-lane cases (not exhaustive — the principle is: the shape is unambiguous):
+- Ownership / authority transfers → `critical`, uncapped.
+- Proxy upgrade functions (`upgradeTo`, `upgradeToAndCall`) → `critical`, reach = full impl (engine handles the propagation).
+- Pure view / getter functions marked permissioned by mistake → `no-impact`.
+- `renounceOwnership` → `critical`.
+- Obvious init-guarded one-shots → `no-impact`.
+
+**Standard lane** — the function body fits on one screen, has one or two storage writes, and the read sites for those writes are clearly local (same contract, obvious timing semantics). Answer Q1 from the body; Q2/Q3 follow directly or are unnecessary.
+
+Typical standard-lane cases:
+- Most `set*` parameter functions on self-contained contracts.
+- Role grants / revokes on an AccessControl contract.
+- Simple pause/unpause toggles where the pause flag's read sites are obvious from a grep within the same file.
+
+**Deep lane** — the fast/standard verdict feels uncertain. Invoke the full three-question walk below. Don't default here for every function; reserve it for cases where:
+- A setter's written field is read in **other** contracts (the flattened file's imports cross contract boundaries).
+- The function's call-graph reach includes heuristic-resolved edges (`TMP_*` storage variables, or contracts you didn't expect).
+- The name suggests future-only but the body writes a field checked on existing-balance paths (or vice versa — name suggests destructive but the path is actually future-bounded).
+- A user-supplied parameter feeds directly into an accounting update (the `configureAssets` / fake-`totalSupply` class of issue).
+- You can't confidently finish the sentence *"if an attacker controls this, they can move/drain/dilute/freeze ___."*
+
+#### Phase 2c — Three questions (deep-lane only)
+
+For each deep-lane function, answer **in order**. Stop as soon as the answer is settled.
+
+**Q1 — What state does this function write, and where is that state read?**
+Grep the storage variable(s) across all flattened sources. If every read lands on a future-only path (new-operation check, next-epoch accounting, next-swap fee computation) and no read touches existing balances, the function is `no-impact`. Stop.
+
+**Q2 — If the caller is malicious, what is the worst-case value movement?**
+Trace forward from the writes to a concrete extraction / devaluation / freeze sink. Name it explicitly: *"Pool.rescueTokens sends any ERC20 held by the Pool to an arbitrary address — no inline bound on token or amount."* If no such sentence completes, the function is `no-impact` and you were over-scoring.
+
+**Q3 — What on-chain state bounds that worst case?**
+Look for `require(x <= CAP)`, balance checks, thresholds, allowances, or an external value like a specific holder's balance, an accrued user balance, or a vault the contract pulls from. This is what becomes the `impactCap` fieldRef in Phase 3a. If nothing bounds it, it's `critical`, uncapped.
+
+#### When the call graph has unresolved edges
+
+A function with unresolved calls (see `call-graph-data.json`) jumps straight to the deep lane even if the signature suggests otherwise — the unresolved calls are exactly where Q1's "where is that state read" tends to hide answers. Print the unresolved set:
 
 ```
 ⚠ UNRESOLVED CALLS for setNotifyAdmin:
   - storageVariable: externalOracle, interface: IOracle, function: getPrice
-  - storageVariable: rewardDistributor, interface: IDistributor, function: distribute
 ```
 
-Fall back to the deep source trace: follow the `/analyze-impact` methodology — identify storage mutations in the function, grep ALL `.flat/` files for read sites of the written field, trace the full call chain from each read site to the entry point where funds are affected, and classify the temporal impact.
+Then follow `/analyze-impact` to trace storage writes through read sites.
 
-Read the `/analyze-impact` skill for the full methodology (Phase 1-3: storage mutation → read site tracing → temporal classification).
+#### Containment labels
 
-#### Impact categories
+When a mitigation is warranted, pick a short containment label that describes *what's actually bounded* — use whatever wording fits the specific situation. Common shapes we've seen:
 
-Evaluate each function against these risk dimensions:
+- **future-only** — effect only applies to new operations (new deposits, next epoch, next swap); existing positions untouched.
+- **rewards-only / incentives-only** — effect contained to a separate reward distribution; core deposits unaffected.
+- **asset-bounded / pool-bounded** — effect bounded to one specific asset or one pool's balance.
+- **timelock-delayed** — routed through a governance timelock with a non-trivial delay.
+- **public-trigger-with-threshold** — the function is public but gated by a threshold outside admin control (emergency modules, kill switches).
+- **disabled-by-state** — the action is impossible given current on-chain state.
+- **claim-DoS** — breaks future claims but doesn't drain accrued balances.
+- **per-user theft** — per-call theft bounded to a single targeted user's unclaimed balance.
 
-- **Fund drain** — Can the caller direct protocol-held funds to an arbitrary address? (e.g. setting a fee recipient, changing a withdrawal address, upgrading to a malicious implementation)
-- **Token devaluation** — Can the caller debase or inflate a protocol token? (e.g. minting tokens, changing exchange rates, manipulating oracles)
-- **Accumulated yield reduction** — Can the caller reduce rewards/fees already earned by depositors? (e.g. changing how `earned()` computes accrued rewards, modifying reward rates retroactively)
-- **Future yield/fee impact** — Can the caller change fees, emission rates, or reward parameters for future periods? (e.g. fee changes that apply on next swap, emission caps for next epoch)
-- **Freeze/DoS** — Can the caller pause, freeze, or block user withdrawals/claims? (e.g. pausing contracts, blacklisting addresses, setting zero addresses)
-- **Configuration change** — Does the function only set addresses, toggle features, or update non-financial governance params with no direct fund impact?
+These are examples, not a fixed vocabulary. Invent a more specific label when it fits the situation better.
 
 #### Scoring rules
 
-- **`critical`** — The function can cause fund drain, token devaluation, accumulated yield reduction, or freeze/DoS on existing depositors. Even if mitigated, the risk category warrants `critical`.
-- **`no-impact`** — The function only affects future parameters (future yield/fees that apply to new interactions), or is purely a configuration change with no path to fund impact.
+- **`critical`** — Q2 yields a concrete worst-case value movement that touches already-committed funds / tokens / yields. Even with a cap, the score stays `critical` and the cap attaches to a mitigation.
+- **`no-impact`** — Q2 yields nothing that touches already-committed state; effect is confined to future behavior, configuration with no fund path, init-guarded, or a purely defensive action (e.g. disabling a safety module).
 
-**Key distinctions:**
-- A fee that applies to future swaps → `no-impact` (past swaps unaffected, accumulated fees unchanged)
-- A parameter read during `distribute()` once per epoch → `no-impact` (only affects future epoch allocations)
-- A parameter that changes how `earned()` computes accrued rewards → `critical` (retroactive)
-- Setting a fee recipient to an arbitrary address → `critical` (fund drain vector)
-- Pausing withdrawals → `critical` (freeze/DoS)
-- Changing an admin address → `critical` (escalation path)
+#### Calibration examples (illustrative, not exhaustive)
 
-**"future-only" mitigation badge**: when a function scores `no-impact` specifically because its effect is bounded to future interactions (new deposits, future swaps, next epoch, etc.) while existing balances remain fully withdrawable, attach a short mitigation entry to make the reasoning explicit on the report:
+These are specific mistakes worth keeping in mind because they illustrate *classes* of error — similar surprises exist in other protocols under other names:
 
-```json
-{
-  "type": "other",
-  "label": "future-only",
-  "description": "Does not touch already-committed funds — users retain full withdrawal rights. The effect is limited to <specific future-path behavior, e.g. 'blocking new deposits', 'changing fees on future swaps', 'altering next-epoch emission allocation'>."
-}
-```
+- **"Freeze" vs "deactivate" on a reserve** look similar but differ on whether withdraws still work. *Class:* if a flag is read by a withdraw path, setting it blocks withdraws → `critical`. If it's only checked on supply/borrow, it's `future-only`. Read the flag's call sites.
+- **Emergency-module "cage" functions** can mean either "trigger emergency shutdown" or "retire this module." *Class:* when a function name suggests destructive action, still trace the state change — sometimes the `live` flag's semantics are inverted relative to what the name implies.
+- **Arming-a-trigger functions** that look like setters. A function that sets an oracle threshold may look benign but arms a public-callable trigger. *Class:* if a function writes a field that gates a public destructive action, the scoring depends on what the destructive action does — not on the setter itself.
+- **Functions that take user-supplied state** (supply totals, balances) and use them in an accounting update. *Class:* on-chain checks based on caller-supplied values can bypass the invariant the field normally enforces — check whether the function re-reads from the authoritative source.
+- **Rewire-the-pipe admin functions** (e.g. setting a new rewards controller) can be live-path-changing *or* orphan-creating. *Class:* trace downstream — if existing accruals continue working on the old pipe, it's a misconfiguration risk, not a fund-impact event.
 
-Use this label consistently across projects so the badge renders uniformly. A pure freeze/DoS that affects already-committed positions (e.g. pausing withdrawals) is NOT future-only — it's `critical`.
+Treat this list as examples of where names deceive. Other projects will have their own variants; the judgment is to distrust the name and read the reads.
 
-#### Temporal context
-
-For each function, note the temporal path:
-
-- **Checkpoint/distribute** — value read during epoch transitions or reward distribution
-- **Swap/trade** — value read on every swap (fee calculation, price computation)
-- **Claim/withdraw** — value read when users claim or withdraw
-- **Governance/config** — sets addresses, toggles, thresholds
-
-**Output — Summary Table:**
+**Output — Summary Table (include containment and lane):**
 
 ```
 IMPACT ANALYSIS RESULTS:
 
-  #  Function              Score       Method  Impact                              Path
-  ── ───────────────────── ─────────── ─────── ─────────────────────────────────── ──────────────
-  1. setDefaultCap         no-impact   API     Future emission cap only            checkpoint
-  2. setRedistributor      critical    API     Changes recipient of excess funds   fund drain
-  3. setNotifyAdmin        critical    DEEP    Controls who triggers distribution  escalation
-  4. bulkUpdateFees        no-impact   API     Fee applies to future swaps only    swap (future)
+  #  Function              Lane      Score       Containment        Worst-case path
+  ── ───────────────────── ─────────  ─────────── ────────────────── ─────────────────────────
+  1. setDefaultCap         standard  no-impact   future-only         Cap read at next ensureDefault()
+  2. setRedistributor      deep      critical    (uncapped)          Sets recipient of excess funds
+  3. setNotifyAdmin        deep      critical    rewards-only        Controls who triggers distribute
+  4. transferOwnership     fast      critical    (uncapped)          Full admin transfer
 ```
 
-**Ask the user to confirm the scores before proceeding.** They may want to adjust.
+**Ask the user to confirm before applying. Do not proceed to Phase 3 without explicit confirmation.**
 
-### Phase 3: Find mitigations (guided by fund impact)
+---
 
-Only look for mitigations on functions where `directFundsUsd > 0` OR `totalReachableFundsUsd > 0` OR `totalTokenValueAtRisk > 0`. For `no-impact` scored functions with zero fund exposure, skip mitigations unless the user explicitly asks.
+### Phase 3: Find mitigations (specific, not generic)
 
-1. **Locate source code** — find the flattened source in `packages/config/src/projects/<project>/.flat/`. Match by address in the filename.
-2. **Analyze each function body** for on-chain constraints (value ranges, delays, relative bounds, other). **Only report a constraint as a mitigation if it actually reduces the amount of funds the caller can move, drain, dilute, or freeze** — not every `require` is a mitigation. State each candidate mitigation as *"Because of this, the caller cannot move/drain/dilute more than X"* before adding it. If the sentence doesn't finish naturally, drop it. Always skip:
-   - Zero-address / zero-value guards (`require(_addr != address(0))`) — prevents misconfig, doesn't cap impact.
-   - "Same value" guards (`require(newState != oldState)`, `require(_new != current)`) — only prevents no-op calls.
-   - Type/kind filters that don't narrow the economic scope (`require(escrowType == MANAGED)` when every MANAGED NFT holds pooled funds).
-   - Self-rotation guards (`require(_new != address(this))`).
-   - Initialization one-shot guards (`require(init == 0)`) — these make the score `no-impact`, not a mitigation.
-   - Array length / non-empty / reentrancy plumbing.
-   - Access control (captured by `ownerDefinitions`).
-3. **Quick-pass for shared patterns** — after finding mitigations on one function, scan other functions on the same contract for the same pattern (e.g., all setters bounded by the same MAX constant, all functions using the same timelock).
-4. **Non-standard constraints** — if a constraint cannot be expressed using the 4 standard types (valueRange, delay, relativeValue, other), **warn the user**: "Found constraint [describe it] that may need manual entry or a custom `other` description."
+Add a mitigation when any of these holds:
+- The function has a non-trivial on-chain constraint that bounds extraction (`valueRange`, `delay`, `relativeValue`).
+- The function scores `no-impact` and needs a containment label + one-sentence explanation of the real path.
+- The function scores `critical` but is subject to an upstream timelock or a scoped restriction (see Phase 3b).
 
-Construct mitigations following the format defined in the `/add-mitigation` skill. Quick reference:
-- **Types**: `valueRange` (min/max bounds), `delay` (timelock/cooldown), `relativeValue` (max change per call), `other` (anything else)
-- **Value modes**: `hardcoded` (literal), `discovered` (tracked in discovered.json), `fieldRef` (path expression like `$self.FIELD`)
-- See `/add-mitigation` for full format spec, JSON examples, and mode selection rules
+**Reject as non-mitigations:**
+- Zero-address / zero-value guards.
+- "Same value" guards.
+- Type/kind filters that don't narrow economic scope.
+- Self-rotation guards (`require(_new != address(this))`).
+- Init one-shot guards (these make the function `no-impact` instead).
+- Access control (captured by `ownerDefinitions`).
 
-**Output — Mitigations by Function:**
+**Write specific descriptions, not boilerplate.** Compare:
+
+> ❌ *"Does not touch already-committed funds — users retain full withdrawal rights."*
+>
+> ✅ *"Even a maliciously low threshold only enables `KillSwitchOracle.trigger()`, whose sole on-chain effect is calling `PoolConfigurator.setReserveBorrowing(asset, false)` on active reserves. Existing borrow positions, collateral deposits, repayments, and withdrawals remain fully functional."*
+
+Name the specific downstream function, the specific bound, and the specific reason existing funds are safe. Three or four sentences max, but every clause must carry information a researcher couldn't derive from the function name.
+
+**Shared patterns pass** — after analyzing one function, scan siblings on the same contract for the same bound (all setters capped by the same `MAX_VALID_*`, all functions routed through the same `wait` modifier).
+
+---
+
+### Phase 3a: Impact caps (first-class, not optional)
+
+For every `critical` function whose worst case is bounded by observable state, attach an `impactCap` mitigation. **Prefer fieldRef + token-unit over hardcoded USD** — caps that drift with price are worse than no cap.
+
+**The canonical shape:**
+
+```json
+{
+  "type": "other",
+  "label": "<containment label>",
+  "description": "<specific worst-case + bound + what's protected>",
+  "impactCap": {
+    "value": {
+      "mode": "fieldRef",
+      "contractAddress": "eth:0x<contract that holds the bound field>",
+      "fieldName": "<discovered field name>"
+    },
+    "unit": {
+      "kind": "token",
+      "tokenAddress": "eth:0x<token the bound is denominated in>"
+    }
+  }
+}
+```
+
+The resolver reads the raw uint from `discovered.json`, divides by `10**decimals`, and multiplies by the token price from `funds-data.json`. The cap auto-updates on every discovery cycle and funds-data refresh.
+
+**Before writing a cap, identify what bounds the worst case.** The answer changes per protocol; here are a few shapes it commonly takes:
+
+1. **Balance of a specific holder.** The protocol pulls from one account (a vault, a treasury, a reward strategy); the caller can't extract more than that account holds. Field: `<token>.balanceOf(<holder>)`.
+2. **A discovered cap field.** The protocol has an on-chain `supplyCap`, `borrowCap`, `mintLimit`, etc. that directly bounds the extractable amount. Field: the cap itself (may need a unit conversion via `multiplier`).
+3. **The target contract's own holdings.** A drain function pulls from `address(this)`. Field: `<token>.balanceOf(<targetContract>)`.
+4. **An allowance or approval.** The caller can only move what's been pre-approved. Field: `<token>.allowance(<owner>, <spender>)`.
+5. **A computed aggregate.** Total debt of a reserve, TVL of a pool, totalSupply of an aToken. Field: the summary.
+
+For each, sanity-check with `cast` before wiring the cap — actual balances often surprise:
+
+```bash
+cast call <TOKEN> "balanceOf(address)(uint256)" <HOLDER> --rpc-url $ETHEREUM_RPC_URL_FOR_DISCOVERY
+cast call <TOKEN> "allowance(address,address)(uint256)" <OWNER> <SPENDER> --rpc-url ...
+cast call <CONTRACT> "<summaryGetter>()(uint256)" --rpc-url ...
+```
+
+A pull-vs-push mismatch is a classic trap: capping at the strategy's own balance reads zero if the strategy pulls from a separate vault on demand. The effective bound is `min(vault.balanceOf, vault→strategy.allowance)`.
+
+**If the bounding field is not already in `discovered.json`, stop and add a handler to `config.jsonc`:**
+
+```jsonc
+"eth:0x<anchor contract that will host the field>": {
+  "fields": {
+    "<bound field name>": {
+      "description": "<what this bounds, for researcher clarity>",
+      "handler": {
+        "type": "call",
+        "method": "function <signature> view returns (<type>)",
+        "args": [<args>],
+        "address": "eth:0x<contract the call targets>"
+      }
+    }
+  }
+}
+```
+
+The anchor contract is whichever discovered contract is semantically closest to the thing being capped — it doesn't have to own the bounding state. Then run `l2b discover <project> --dev` and confirm the field populated before writing the cap.
+
+**Tag the cap's unit token** with `isToken: true` so its price + decimals populate `funds-data.json`:
+
+```bash
+curl -s -X PUT "localhost:2021/api/projects/<project>/contract-tags" \
+  -H "Content-Type: application/json" \
+  -d '{"contractAddress":"eth:0x<TOKEN>","isExternal":true,"entity":"<issuer>","isToken":true}'
+```
+
+Confirm `tokenInfo` is present in `funds-data.json`. If the DeFiScan endpoints server isn't running and the fetch fails, seed `tokenInfo` manually from an on-chain oracle (e.g. the project's own `AaveOracle.getAssetPrice`) + `totalSupply()` via `cast` — don't block the cap on an external service.
+
+**When to use each unit:**
+- `unit: token` + `value: fieldRef` — the default. Auto-updates with balance + price.
+- `unit: usd` + `value: hardcoded` — only when the bound is a fixed fiat amount nobody expects to move (rare). Flag it as "stale-risk; revisit on <condition>".
+- `unit: scaler` — for ratio caps; rarely needed in scoring workflows.
+- `multiplier` — use when the field needs a fractional adjustment (e.g. `supplyCap` × LTV when the worst case is the collateralizable portion, not the full cap).
+
+**Don't over-reach with caps.** A fieldRef cap works when the relationship "worst-case value moveable ≤ field value" is obviously true from the source. If the cap requires assumptions about attacker behavior or protocol-level invariants, prefer an uncapped `critical` with a descriptive mitigation over a fragile cap.
+
+---
+
+### Phase 3b: Mitigation placement (three rules, stated once)
+
+Get this wrong and the cap either doesn't propagate or over-propagates. Three distinct placements, all needed for different views:
+
+**1. Global leaf cap** — on the *called* function of the external dependency, no `scopedTo`.
+Example: `LRTOracle.getAssetPrice` or `LRTOracle.rsETHPrice`.
+Purpose: the engine uses this as the per-reachable-contract clamp when any upstream function's reach includes that leaf. Also propagates as a transitive mit through forward-BFS.
+
+**2. Scoped-to-dependency self-cap** — on **direct callers** per `call-graph-data.json`, with `scopedTo: { address: <depAddress>, type: "dependency" }`.
+Extract the direct caller set:
+
+```bash
+python3 -c "
+import json
+cg = json.load(open('packages/config/src/projects/<p>/call-graph-data.json'))
+dep = '<eth:0xDEPADDR>'.lower()
+for a, c in cg['contracts'].items():
+    for e in c.get('externalCalls', []):
+        if (e.get('resolvedAddress') or '').lower() == dep:
+            print(f\"{c.get('name','?')}.{e['callerFunction']} -> {e.get('calledFunction')}\")"
+```
+
+Do NOT apply this to every function the dependency analysis *lists* — only to the direct callers from the call graph. The engine propagates the cap to transitive reachers via forward-BFS. Over-applying the scoped mit is harmless but noisy.
+
+**3. Scoped-to-admin self-cap** — on functions the admin directly calls, with `scopedTo: { address: <adminAddress>, type: "admin" }`.
+Use this to attach upstream timelock or multi-path-gated mitigations (e.g. "all actions via DSPauseProxy are subject to a 1-day DSPause timelock"). Same direct-callee rule applies — put the mit on each function the admin directly owns.
+
+**Upgrade functions (`upgradeTo`, `upgradeToAndCall`) are special.** They have no outgoing call-graph edges themselves but semantically grant the full impl reach. The engine now seeds upgrade-function BFS with every caller function on the contract, so a cap on the leaf or on a direct caller of the dependency propagates correctly into upgrade-function views. Just place your caps correctly per rule 1/2/3 — the engine handles the rest.
+
+---
+
+### Phase 3c: Present the plan
+
+Before applying, print the complete plan for researcher review:
 
 ```
-MITIGATIONS FOUND:
+MITIGATIONS + CAPS TO APPLY:
 
-setDefaultCap (no-impact, $0 funds):
-  (skipped — no fund impact)
+setDefaultCap  (no-impact, future-only, $0 funds):
+  mit: [other / future-only] "Cap is read when ensureDefault() runs; never touches existing balances."
+  cap: none
 
-setRedistributor (critical, $12.4M reachable):
-  1. [other] Cannot be set to current VE team address
-     Source: require(redistributor != IVotingEscrow(IVoter(voter).ve()).team(), "ET")
+setRedistributor  (critical, $12.4M reachable, asset-bounded):
+  mit: [other / asset-bounded]  "Routes excess WETH to an arbitrary address; bounded to pool WETH balance."
+  cap: fieldRef CLGauge.poolWethBalance (unit: token WETH)
+  placement: direct, on this function
 
-setNotifyAdmin (critical, $12.4M reachable):
-  (no mitigations beyond access control)
-
-bulkUpdateFees (no-impact, $0 funds):
-  (skipped — no fund impact)
+Pool.borrow  (critical, direct Kelp caller):
+  mit: [other / bounded-by-spark-rsETH-pool]  scopedTo: { LRTOracle, dependency }
+  cap: fieldRef LRTOracle.sparkRsETHPoolBalance (unit: token rsETH)
+  placement: direct Kelp caller per call-graph (resolvedAddress == LRTOracle)
 ```
 
-**Ask the user to confirm which mitigations to apply.** They may want to skip some or adjust descriptions.
+**Wait for explicit user confirmation before proceeding.** If a new handler or tokenInfo seeding is needed, list those as separate actions to confirm.
 
-### Phase 4: Apply scores and mitigations via API
+---
 
-For each function, save via the functions update API. This ensures correct address normalization, attribution stamping, and config severity integration (auto-writes `severity: "HIGH"` for mitigatedField references).
-
-**Per-function update:**
+### Phase 4: Apply scores and mitigations
 
 ```bash
 curl -s -X PUT "localhost:2021/api/projects/<project>/functions" \
@@ -224,17 +364,126 @@ curl -s -X PUT "localhost:2021/api/projects/<project>/functions" \
   }'
 ```
 
-The API merges with existing data — only the fields you send are updated. Existing `ownerDefinitions`, `delay`, `checked`, etc. are preserved.
+Rules:
+- Send the **full** mitigations array (API replaces it). To append, GET current function data first and concat.
+- Preserve existing `score` if this call is just adding mitigations, and vice versa.
+- Do not change scores the user has explicitly overridden.
+- Do not add access control as a mitigation (captured by `ownerDefinitions`).
 
-#### Rules
+For non-permissioned leaf functions (e.g. `LRTOracle.getAssetPrice` — the external dependency's entry), still use the same endpoint, with `isPermissioned: false` alongside the mitigation. The engine indexes it for transitive propagation.
 
-- Set `score` to `"critical"` or `"no-impact"` as confirmed
-- Set `mitigations` to the full array (existing + new) — the API replaces the whole array
-- To read existing mitigations before appending, fetch the current function data from `GET /api/projects/<project>/functions` first
-- Do NOT change scores that the user has explicitly overridden
-- Do NOT add access control as a mitigation
+---
 
-### Phase 5: Final report
+### Phase 5: Verify caps resolve
+
+**Do not skip this phase.** Until you've checked the numbers drop, you don't know the cap is working.
+
+```bash
+# 1. Recompile the review
+curl -s -X POST "localhost:2021/api/projects/<project>/compile-review" > /dev/null
+
+# 2. Check admin view for the affected function's caps
+curl -s "localhost:2021/api/projects/<project>/admins?contract=<address>" \
+  | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for a in d['admins']:
+    for f in a['functions']:
+        for rc in f.get('reachableContracts', []):
+            cap = rc.get('effectiveCapUsd')
+            if cap is not None:
+                print(f\"{a['name']} / {f['functionName']} -> {rc['contractName']}: funds=\${rc['fundsUsd']:,.0f} cap=\${cap:,.0f}\")"
+
+# 3. Check dependency view if you placed dep-scoped caps
+curl -s "localhost:2021/api/projects/<project>/dependencies" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for dep in d['dependencies']:
+    reach = dep.get('totalFundsAtRisk',0) + dep.get('totalTokenValueAtRisk',0)
+    print(f'{dep[\"name\"]}: \${reach:,.0f}')"
+```
+
+**Interpret the result:**
+- `effectiveCapUsd = None` with a cap expected → cap isn't resolving. Most common causes:
+  1. Token not tagged `isToken: true`.
+  2. `tokenInfo` missing from `funds-data.json` (endpoints service not running or fetch failed — seed manually).
+  3. Field missing from `discovered.json` (handler not run or failed — re-run `l2b discover`).
+  4. Address case mismatch (check checksum).
+- Dep reach didn't drop → check that your direct-caller detection caught the right set. Run the `resolvedAddress` grep and diff against what you applied.
+- Admin direct funds still unbounded → the admin's direct callees may still need scoped self-caps (`scopedTo.type: admin`).
+
+If anything is wrong, fix and re-verify. **Never end the run with caps that don't resolve.**
+
+---
+
+### Phase 6: Explicit mitigation + cap roster (mandatory)
+
+**At the end of every run, list every mitigation written and every cap resolved, so the researcher can audit without re-reading any file.** Never summarize this away. Format:
+
+```
+═══════════════════════════════════════════════════════════════════════════════
+MITIGATIONS + CAPS APPLIED — <project> / <contract or --all>
+═══════════════════════════════════════════════════════════════════════════════
+
+1. Pool.borrow  (eth:0xC13e...)
+   score: critical
+   mits:
+     [other / bounded-by-spark-rsETH-pool]  scopedTo: LRTOracle (dependency)
+         cap: fieldRef LRTOracle.sparkRsETHPoolBalance  unit: token rsETH
+         resolved: $37,915.39  (15.32 rsETH × $2,475.48)
+   placement: direct Kelp caller (call-graph resolvedAddress == LRTOracle)
+
+2. EmissionManager.setClaimer  (eth:0xf09e...)
+   score: critical
+   mits:
+     [other / rewards-only]  global
+         cap: fieldRef EmissionManager.rewardsVaultWstETHBalance  unit: token wstETH
+         resolved: $76,049.71  (26.47 wstETH × $2,873.10)
+     [other / per-user reward theft]  global
+         cap: (inherits rewards-only cap)
+         resolved: $76,049.71
+
+3. LRTOracle.getAssetPrice  (eth:0x349A...)  [non-permissioned leaf]
+   score: n/a
+   mits:
+     [other / bounded-by-spark-rsETH-pool]  global
+         cap: fieldRef LRTOracle.sparkRsETHPoolBalance  unit: token rsETH
+         resolved: $37,915.39
+
+4. (... every mit, every cap, with its resolved USD value)
+
+─────────────────────────── NEW HANDLERS ADDED ───────────────────────────
+
+- EmissionManager.rewardsVaultWstETHBalance
+    wstETH.balanceOf(0x8076...)  →  26.47 wstETH
+- LRTOracle.sparkRsETHPoolBalance
+    rsETH.balanceOf(0x856f1Ea7...)  →  15.32 rsETH
+
+─────────────────────────── TOKEN TAGS ADDED ─────────────────────────────
+
+- eth:0x7f39C581... (wstETH)  isToken: true
+- eth:0xA1290d69... (rsETH)   isToken: true
+
+─────────────────────────── VERIFICATION ────────────────────────────────
+
+Admin totals (before → after):
+  2/3 GnosisSafe (EmissionManager admin):   $1.90B → $76K   ✓
+Dependency totals (before → after):
+  LRTOracle (Kelp):                          $3.35B → $102K ✓
+  RSETHExchangeRateOracle (Spark wrapper):   $1.90B → $76K  ✓
+
+Unresolved caps: 0   (all caps resolved to concrete USD)
+
+═══════════════════════════════════════════════════════════════════════════════
+```
+
+Any cap that failed to resolve (`effectiveCapUsd = None`) must appear in an "UNRESOLVED CAPS" section with the reason — never hide it. The roster is the contract of the run: if it isn't in the roster, it wasn't applied.
+
+---
+
+### Phase 7: Short summary (familiar format)
+
+After the roster, a one-screen summary for workflow scanning:
 
 ```
 ═══════════════════════════════════════════════════
@@ -244,19 +493,20 @@ CONTRACT SCORING: CLGaugeFactory (base:0xB630...)
 Permissioned functions: 6
   Skipped (fully reviewed): 1
   Analyzed: 5
-  Analysis method: 4 via API, 1 via deep source trace
 
 RESULTS:
-  Function              Score       Mitigations Added
-  ─────────────────────────────────────────────────────
-  setDefaultCap         no-impact   0 (no fund impact)
-  setRedistributor      critical    1 (other: cannot be VE team)
-  setEmissionAdmin      —           skipped (already reviewed)
-  setNotifyAdmin        critical    0
-  bulkUpdateFees        no-impact   0 (no fund impact)
+  Function              Score       Containment      Mits  Cap
+  ─────────────────────────────────────────────────────────────────
+  setDefaultCap         no-impact   future-only      1     —
+  setRedistributor      critical    asset-bounded    1     $12.4M
+  setNotifyAdmin        critical    (uncapped)       0     —
+  bulkUpdateFees        no-impact   future-only      1     —
 
 Scores set: 4 (2 critical, 2 no-impact)
-Total mitigations added: 1
+Mitigations added: 3
+Caps resolved: 1 ($12.4M)
+New handlers: 0
+Token tags: 0
 ═══════════════════════════════════════════════════
 ```
 
@@ -268,52 +518,31 @@ When invoked as `/score-contract <project> --all --interactive`:
 
 ### Phase 0: Build contract queue
 
-Read `functions.json` and extract all contract addresses that have at least one permissioned function where either:
-- `score` is `"unscored"` or missing
-- `mitigations` is missing (and function has fund impact)
-
-Sort contracts by name for predictable order. Print the queue:
-
-```
-SCORING QUEUE: 17 contracts with unscored permissioned functions
-
-  1. CLGaugeFactory (base:0xB630...)          — 5 unscored functions
-  2. CLGauge (base:0xA123...)                 — 3 unscored functions
-  3. Voter (base:0xD456...)                   — 8 unscored functions
-  ...
-```
+Read `functions.json` and extract contracts with at least one permissioned function where `score == "unscored"` or `mitigations` is missing and the function has fund impact. Sort by name; print the queue.
 
 ### Loop: Process each contract
 
-For each contract in the queue:
-
+For each contract:
 1. Print header: `Processing contract 3/17: CLGaugeFactory (base:0xB630...)`
-2. Execute Phases 1-3 for this single contract
-3. Present the results (scores + mitigations found)
-4. **Wait for user input:**
-   - **confirm** — save scores and mitigations via Phase 4, move to next contract
-   - **adjust** — user provides corrections (e.g. "change setFoo to no-impact", "skip the valueRange mitigation on setBar"), then save
-   - **skip** — do not save anything for this contract, move on
-5. Print progress: `Completed 3/17 contracts. 14 remaining.`
+2. Execute Phases 1–3c
+3. Present plan; wait for confirmation
+4. On confirm: Phase 4 (apply) → Phase 5 (verify) → Phase 6 (roster for this contract) → progress print
+5. On adjust: apply corrections then continue
+6. On skip: don't save, move on
 
-### Final aggregate report
+### Final aggregate roster
 
-After all contracts are processed:
+After all contracts, emit **one consolidated Phase 6 roster** spanning the whole run: every mitigation written, every cap resolved, every new handler, every token tag, every before/after admin+dep total. Then the short summary.
 
-```
-═══════════════════════════════════════════════════
-PROJECT SCORING COMPLETE: aerodrome
-═══════════════════════════════════════════════════
+---
 
-Contracts processed: 17
-  Confirmed: 14
-  Skipped: 3
+## Anchor reminders
 
-Functions scored: 42
-  Critical: 18
-  No-impact: 24
-
-Mitigations added: 15
-  valueRange: 8, delay: 2, relativeValue: 1, other: 4
-═══════════════════════════════════════════════════
-```
+- **Triage, then read proportionately.** Most functions resolve from signature + a glance. Reserve the full storage-trace for cases where the fast verdict feels uncertain.
+- **Load source once per contract.** Scan for shared bounds and global state flags up front; reuse across every function on that contract.
+- **Name the containment.** Pick whatever short label describes what's actually bounded. The label is half the researcher value.
+- **Cap with fieldRef + token-unit when you can verify the relationship holds.** Hardcoded USD caps rot. Uncapped `critical` with a good description beats a fragile cap.
+- **Direct callers only for scoped dep-caps.** The engine propagates transitively from there.
+- **Verify before finishing.** A cap that doesn't resolve is worse than no cap.
+- **Print the roster.** Mitigations and caps that aren't explicitly listed at end-of-run effectively don't exist from the researcher's perspective.
+- **Don't pattern-match from past projects.** The calibration examples are illustrative of classes of mistake; each protocol will have its own variants. Trust the source over the function name.
