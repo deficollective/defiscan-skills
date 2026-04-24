@@ -13,12 +13,17 @@ Uses **structured API data** (call graph, fund reachability, capital analysis) a
 
 ```
 /score-contract <project> <contractAddress>
+/score-contract <project> <addr1> <addr2> <addr3> ...
+/score-contract <project> <addr1,addr2,addr3>
 /score-contract <project> --all --interactive
 ```
 
 - **project** — project folder name (e.g. `aerodrome`, `aave-v3`)
 - **contractAddress** — chain-prefixed contract address (e.g. `base:0xB630...`) or contract name (e.g. `CLGaugeFactory`). Add chain prefix if omitted.
+- **Multiple addresses** — pass several positional addresses, OR a single comma-separated list, to score a specific batch of contracts one after another. Same interactive confirmation as `--all --interactive`, but limited to the given list. Names and addresses may be mixed; normalize addresses by lowercasing when matching.
 - **--all --interactive** — score every contract with permissioned functions, one at a time, waiting for user confirmation after each.
+
+When a list of addresses is provided, use the `--all --interactive` loop (Phase 0 + Loop below) but build the contract queue from the supplied list instead of from all contracts with unscored functions. Preserve the input order.
 
 ## Instructions
 
@@ -124,6 +129,18 @@ Evaluate each function against these risk dimensions:
 - Pausing withdrawals → `critical` (freeze/DoS)
 - Changing an admin address → `critical` (escalation path)
 
+**"future-only" mitigation badge**: when a function scores `no-impact` specifically because its effect is bounded to future interactions (new deposits, future swaps, next epoch, etc.) while existing balances remain fully withdrawable, attach a short mitigation entry to make the reasoning explicit on the report:
+
+```json
+{
+  "type": "other",
+  "label": "future-only",
+  "description": "Does not touch already-committed funds — users retain full withdrawal rights. The effect is limited to <specific future-path behavior, e.g. 'blocking new deposits', 'changing fees on future swaps', 'altering next-epoch emission allocation'>."
+}
+```
+
+Use this label consistently across projects so the badge renders uniformly. A pure freeze/DoS that affects already-committed positions (e.g. pausing withdrawals) is NOT future-only — it's `critical`.
+
 #### Temporal context
 
 For each function, note the temporal path:
@@ -153,7 +170,14 @@ IMPACT ANALYSIS RESULTS:
 Only look for mitigations on functions where `directFundsUsd > 0` OR `totalReachableFundsUsd > 0` OR `totalTokenValueAtRisk > 0`. For `no-impact` scored functions with zero fund exposure, skip mitigations unless the user explicitly asks.
 
 1. **Locate source code** — find the flattened source in `packages/config/src/projects/<project>/.flat/`. Match by address in the filename.
-2. **Analyze each function body** for on-chain constraints (value ranges, delays, relative bounds, other). Do NOT include access control as a mitigation.
+2. **Analyze each function body** for on-chain constraints (value ranges, delays, relative bounds, other). **Only report a constraint as a mitigation if it actually reduces the amount of funds the caller can move, drain, dilute, or freeze** — not every `require` is a mitigation. State each candidate mitigation as *"Because of this, the caller cannot move/drain/dilute more than X"* before adding it. If the sentence doesn't finish naturally, drop it. Always skip:
+   - Zero-address / zero-value guards (`require(_addr != address(0))`) — prevents misconfig, doesn't cap impact.
+   - "Same value" guards (`require(newState != oldState)`, `require(_new != current)`) — only prevents no-op calls.
+   - Type/kind filters that don't narrow the economic scope (`require(escrowType == MANAGED)` when every MANAGED NFT holds pooled funds).
+   - Self-rotation guards (`require(_new != address(this))`).
+   - Initialization one-shot guards (`require(init == 0)`) — these make the score `no-impact`, not a mitigation.
+   - Array length / non-empty / reentrancy plumbing.
+   - Access control (captured by `ownerDefinitions`).
 3. **Quick-pass for shared patterns** — after finding mitigations on one function, scan other functions on the same contract for the same pattern (e.g., all setters bounded by the same MAX constant, all functions using the same timelock).
 4. **Non-standard constraints** — if a constraint cannot be expressed using the 4 standard types (valueRange, delay, relativeValue, other), **warn the user**: "Found constraint [describe it] that may need manual entry or a custom `other` description."
 

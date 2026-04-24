@@ -1,8 +1,7 @@
 ---
 name: scan-permissions
 description: Scan contract source code to identify permissioned functions and construct verified owner path expressions. Reads source code and discovered.json to cross-reference and validate paths resolve correctly.
-disable-model-invocation: true
-argument-hint: "<project-name> [contract-address] [--compare]"
+argument-hint: "<project-name> [address-or-addresses] [--compare]"
 allowed-tools: Bash, Read
 ---
 
@@ -11,10 +10,10 @@ allowed-tools: Bash, Read
 You are a smart contract permission analyzer. Your task is to scan contracts for the project **$0**, identify all permissioned state-changing functions, construct owner path expressions, and **verify each path resolves** against the discovered data before saving.
 
 **Arguments** (positional, order-flexible):
-- A contract address (`eth:0x...` or `0x...`) → scan only that contract. If omitted, scan all non-external, non-EOA contracts.
+- One or more contract addresses (`eth:0x...`, `base:0x...`, or `0x...`) → scan only those contracts. Addresses may be provided as separate arguments OR as a single comma-separated list (e.g. `0xAbc...,0xDef...`). If no address is given, scan all non-external, non-EOA contracts.
 - `--compare` flag → **compare mode**: do NOT save anything. Instead, show a detailed diff between existing function data and what the agent found. This lets the researcher review differences before committing changes.
 
-Parse `$ARGUMENTS` to detect these. The project name is always `$0`. Any remaining argument that looks like an address is the contract filter; `--compare` enables compare mode.
+Parse `$ARGUMENTS` to detect these. The project name is always `$0`. Any remaining argument that looks like an address (or a comma-separated list of addresses) becomes the contract filter — collect them all into a target set; `--compare` enables compare mode.
 
 Before you begin, read the supporting reference files in this skill directory:
 - [PATH_REFERENCE.md](PATH_REFERENCE.md) — owner path expression syntax, rules, and examples
@@ -66,7 +65,7 @@ Read `/tmp/scan-contract-list.json` to get the list of contracts.
   Exclude any contract matching these addresses.
 - **Non-contract entries**: Only include entries that have a `name` (real contracts). Skip EOAs and multisigs.
 
-If a contract address argument was provided, filter to only that specific address.
+If one or more contract address arguments were provided, filter to only those addresses (case-insensitive match). Normalize each by lowercasing before comparison to avoid checksum mismatches.
 
 ### 0d. Note existing functions
 
@@ -193,6 +192,52 @@ From the source code, identify **every** storage variable or mechanism that gran
 ### 3b. Map to a path expression
 
 Using the rules in [PATH_REFERENCE.md](PATH_REFERENCE.md), construct the owner path expression.
+
+**Always prefer `$self.field` or `@field.subPath` over an absolute `eth:0xAddress.subPath`.** Before writing any path that contains a hard-coded contract address, check the current contract's `fields[]` (already extracted in Step 2b) for a field whose value equals that address. If one exists, use the field reference instead — it self-documents the intent and survives address changes.
+
+A path like bare `eth:0xAddress` (no dot, no value path) is **invalid** and will not resolve. To say "the contract at X is the owner", find a field on `$self` whose value is X and use `$self.<fieldName>`. Example: AToken's `mint` is `onlyPool`, and AToken has a `POOL` field — write `$self.POOL`, never bare `eth:0xPoolAddress`.
+
+Fallback to absolute `eth:0xAddress.subPath` is only acceptable when the current contract has no field pointing to the target. The most common case is multi-hop chains the path system can't express (e.g. `@ADDRESSES_PROVIDER.@getACLManager.accessControl...` is not valid — the resolver supports only one `@field` hop).
+
+**Express the immediate caller, not the ultimate human controller.** For each permissioned function, the owner path should describe **who can directly invoke it** — not the governance entity at the end of a chain. The capital-graph traversal handles the rest. Example: AToken's `upgradeTo` is gated by `ifAdmin` where `_admin = PoolConfigurator` (set at deployment). The correct owner is PoolConfigurator (the immediate caller). Do **not** shortcut to POOL_ADMIN_ROLE on ACLManager — even though that's the human governance role, the graph will follow PoolConfigurator → its `onlyPoolAdmin` functions → ACLManager itself.
+
+#### When the immediate caller is in an immutable / private state variable
+
+Some proxy patterns store the admin in immutable bytecode or private storage (no public getter), so it doesn't appear automatically in `discovered.json`. Common examples:
+
+- **Aave's `InitializableImmutableAdminUpgradeabilityProxy`**: `_admin` is immutable, set at construction. Its `admin()` getter is gated by `ifAdmin`, so discovery can't read it via `eth_call` (returns ZERO).
+- Other proxies with `address private _admin` and no public getter.
+
+When this happens, **add a discovery handler in `config.jsonc`** to surface the value, then reference it in your path:
+
+| Situation | Handler | Field path |
+|---|---|---|
+| Constructor takes the admin as an arg, contract was deployed standalone (its own creation tx) | `constructorArgs` with `nameArgs: true` | `$self.constructorArgs.<argName>` |
+| Same as above, but contract was factory-deployed (no clean creation tx for the proxy) | `hardcoded` (manually inspect deployment trace once, hardcode the address) | `$self.<fieldName>` (whatever name you chose) |
+| Address is known to be a singleton invariant of the protocol | `hardcoded` | `$self.<fieldName>` |
+
+Concrete config snippets:
+
+```jsonc
+// constructorArgs (works when discovery can fetch the contract's own creation tx)
+"eth:0xProxyAddr": {
+  "fields": {
+    "constructorArgs": { "handler": { "type": "constructorArgs", "nameArgs": true } }
+  }
+}
+// → field becomes: constructorArgs = { admin: "eth:0x..." }
+// → path: $self.constructorArgs.admin
+
+// hardcoded (factory-deployed proxies, or when constructorArgs misparses)
+"eth:0xProxyAddr": {
+  "fields": {
+    "proxyAdmin": { "handler": { "type": "hardcoded", "value": "eth:0xActualAdmin" } }
+  }
+}
+// → path: $self.proxyAdmin
+```
+
+After adding the handler, re-run `l2b discover <project>` and re-scan — your owner paths can now use the field reference instead of an absolute address.
 
 ### 3c. Verify the path resolves
 

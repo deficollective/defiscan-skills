@@ -290,6 +290,23 @@ Tracks state changes via blockchain events.
 }
 ```
 
+**`set` variant — per-key overwrite (use for mappings with a single "update" event)**:
+
+When the on-chain state is a `mapping(K => V)` that's mutated via one event that carries both the key and the new value (no separate add/remove), use `set` instead of `add`/`remove`. Each event overwrites the prior value for its group key, so the output is always the current map state.
+
+```jsonc
+"assetSources": {
+  "handler": {
+    "type": "event",
+    "select": "source",
+    "groupBy": "asset",
+    "set": { "event": "event AssetSourceUpdated(address indexed asset, address indexed source)" }
+  }
+}
+```
+
+This materializes the live `asset → source` map. Same pattern fits `EmissionAdminUpdated(reward, oldAdmin, newAdmin)` (select `newAdmin`, groupBy `reward`), `AddressSet(name, newAddress)` in taiko-style registries, etc. Prefer `set` over a self-cancelling `add`/`remove` pair on the same event — it's clearer and keeps the output as a `Record<key, value>` rather than an array.
+
 ---
 
 ## Lido ACL Handler

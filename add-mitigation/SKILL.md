@@ -40,18 +40,34 @@ Find the flattened source in `packages/config/src/projects/<project>/.flat/`. Ma
 
 ### Phase 2: Analyze the function
 
-Read the function body and identify **on-chain constraints** that limit what the caller can do:
+Read the function body and identify **on-chain constraints that meaningfully limit the potential fund impact** of the function. The bar for reporting a mitigation is: *"does this constraint reduce the amount of funds the caller can move, drain, dilute, or freeze?"* If the answer is no, do NOT report it as a mitigation.
 
-1. **Value range** (`type: "valueRange"`) — `require(value <= MAX)`, `require(value >= MIN)`, or `require(value != 0)`
-2. **Delay** (`type: "delay"`) — timelocks, cooldown periods, `block.timestamp >= lastAction + DELAY`
-3. **Relative value** (`type: "relativeValue"`) — max change per call, e.g. `newRate = oldRate + NUDGE`
-4. **Other** (`type: "other"`) — any other constraint (rate limiting, once-per-epoch, formula-driven amounts)
+Valid mitigation types:
+
+1. **Value range** (`type: "valueRange"`) — `require(value <= MAX)`, `require(value >= MIN)` where the bound actually caps a financial parameter (fee, rate, cap, weight). Also `require(value != 0)` when the field is a financial parameter.
+2. **Delay** (`type: "delay"`) — timelocks, cooldown periods, `block.timestamp >= lastAction + DELAY` giving affected users time to react.
+3. **Relative value** (`type: "relativeValue"`) — max change per call, e.g. `newRate = oldRate + NUDGE`.
+4. **Other** (`type: "other"`) — rate limiting, once-per-epoch caps, formula-driven amount bounds, bytecode-level whitelists that restrict *who can be affected*.
 
 For each constraint found, determine:
 - The **bound values** (constants, storage variables, or computed)
 - Whether the bound is **hardcoded** (literal in code), **discovered** (a contract field we track in `discovered.json`), or a **fieldRef** (a path expression like `$self.MAX_FEE`)
 
 If a constraint cannot be expressed using the standard mitigation types above, **warn the user**: "Found constraint [describe it] but it cannot be represented in the standard mitigation format. Manual review or a custom `other` type with a descriptive text may be needed."
+
+#### Do NOT report these as mitigations
+
+Many `require`/`if` checks in permissioned functions are **sanity/invariant guards** that don't bound the financial impact. Filter them out — they pollute the risk view and distract the reader from real mitigations.
+
+- **Zero-address / zero-value guards** on address fields (`require(_newAddress != address(0))`). Doesn't limit impact; just prevents the caller from pointing at the zero address.
+- **"Same value" guards** (`require(newState != oldState)`, `require(_newAddress != currentAddress)`). Only prevents no-op calls, zero risk-reduction effect.
+- **Type/kind filters** that don't narrow the economic scope (`require(escrowType[id] == EscrowType.MANAGED)` when *every* MANAGED NFT holds pooled funds — narrowing to a type doesn't narrow the exposure).
+- **Access control** (`require(msg.sender == owner)`). This is captured by `ownerDefinitions`, not as a mitigation.
+- **Self-rotation guards** (`require(_newManager != address(this))`). Sanity, not risk-limiting.
+- **Initialization one-shot guards** (`require(initializedAt == 0)`). These make the score `no-impact` (the owner is already consumed), not a mitigation.
+- **Array length equality checks**, **non-empty array checks**, **reentrancy guards** — protocol-correctness plumbing, not fund-impact bounds.
+
+Rule of thumb: state the mitigation as *"Because of this constraint, the caller cannot move/drain/dilute more than X"*. If the sentence doesn't finish naturally, it's not a mitigation — drop it.
 
 ### Phase 3: Present findings
 

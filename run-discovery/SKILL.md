@@ -20,6 +20,37 @@ The l2b UI server must be running at `http://localhost:2021`. If not, tell the u
 
 ---
 
+## Core mental model
+
+Most of discovery is not "remove external contracts from the graph" — it's **"keep them in the graph as named leaf nodes, tagged external, but with every address-valued field blocked so discovery doesn't walk downstream"**.
+
+Why: a leaf external contract is useful — it shows up in the UI, appears in dependency analysis, gets a proper entity label ("Chainlink", "MakerDAO"). A contract removed via `ignoreDiscovery: true` disappears entirely: it can't be tagged, it can't be shown as a dep, and if the user later wants to add a handler on it they have to revert the prune.
+
+**Default move for any external contract: "leaf it"** — list every address-valued field in `ignoreRelatives`, then tag it as external via the API. `ignoreDiscovery: true` is a rare escape hatch, not the first tool to reach for.
+
+### `ignoreRelatives` vs `ignoreRelative` — two different things
+
+This is a naming footgun. Both exist, and they do different things:
+
+- **`ignoreRelatives`** (plural, **contract-level** override): an array of field names. "On this contract, don't follow these specific fields as relatives."
+  ```jsonc
+  "eth:0xExternalContract": {
+    "ignoreRelatives": ["owner", "implementation", "feed"]
+  }
+  ```
+- **`ignoreRelative`** (singular, **inside a single handler**): a boolean. "For THIS handler's output specifically, don't follow the addresses it returns as relatives."
+  ```jsonc
+  "fields": {
+    "wards": {
+      "handler": { "type": "event", ..., "ignoreRelative": true }
+    }
+  }
+  ```
+
+When pruning external contracts, you almost always want the plural form on the contract override. The singular form on a handler is a niche tool — see the handler section for when it's right.
+
+---
+
 ## Step 0: Setup
 
 ### 0a. Validate server is running
@@ -297,6 +328,47 @@ When a contract is classified as external, the goal is to keep it visible in the
 
 To know which fields to list: check the discovery output for the `R eth:0x...` (relative) lines under that contract — each relative is an address found in one of the contract's fields. Cross-reference each relative address against the contract's field values (from `/tmp/discovery-$0-contracts.json` or the API) to determine which field name produced it. List all those field names in `ignoreRelatives`.
 
+**Faster: grep the contract source directly.** Discovery caches every fetched source in `packages/config/cache/discovery.sqlite` under key `<chain>.getSource.<address>`. Reading it once tells you every address-typed field a contract exposes, so you can write the full `ignoreRelatives` list in one pass instead of iterating discovery N times waiting for each new leak to surface.
+
+```bash
+python3 <<'PY'
+import sqlite3, re
+db = sqlite3.connect('packages/config/cache/discovery.sqlite')
+src = db.execute("SELECT value FROM cache WHERE key = ?", ('ethereum.getSource.0xYOUR_LEAF_ADDRESS',)).fetchone()[0]
+fields = set()
+for m in re.finditer(r'(?:address|I[A-Z]\w+)\s+public\s+(?:immutable\s+|constant\s+)?(\w+)', src):
+    fields.add(m.group(1))
+for m in re.finditer(r'function\s+(\w+)\s*\(\s*\)\s*(?:public|external)?[^)]*returns\s*\(\s*(?:address|I[A-Z]\w+)', src):
+    fields.add(m.group(1))
+for m in re.finditer(r'mapping\s*\([^)]*=>\s*(?:address|I[A-Z]\w+)\)\s+(?:public|internal|private)\s+(\w+)', src):
+    fields.add(m.group(1))
+print(sorted(fields))
+PY
+```
+
+Also remember proxy escapes: for any contract detected as a proxy, add `$admin` and `$implementation` to `ignoreRelatives` too (they're proxy-slot relatives that flow separately from the contract's own field values).
+
+### Known external leaf patterns
+
+Reference table for the most common externals — saves you from re-grepping source each time:
+
+| Contract pattern | Fields to put in `ignoreRelatives` |
+|---|---|
+| Chainlink `EACAggregatorProxy` | `owner`, `aggregator`, `accessController`, `proposedAggregator` |
+| Chronicle core oracle | `authed`, `feeds`, `tolled` |
+| RedStone price feed (ERC1967 proxy) | `$admin`, `$implementation`, `admin`, `implementation`, `owner`, `getPriceFeedAdapter` |
+| Maker `DSPause` / `DSPauseProxy` | `authority`, `proxy`, `owner` |
+| Maker ESM | `end`, `gem`, `proxy` |
+| Maker `Pot` | `vat`, `vow` |
+| Circle `FiatToken` (USDC, cbBTC) | `$admin`, `$implementation`, `admin`, `implementation`, `blacklister`, `masterMinter`, `owner`, `pauser`, `rescuer` |
+| Tether `USDT` | `owner`, `getOwner`, `upgradedAddress` |
+| Lido `wstETH` | `stETH` |
+| Renzo `RestakeManager` | `$admin`, `$implementation`, `collateralTokens`, `delegationManager`, `depositQueue`, `ezETH`, `operatorDelegators`, `renzoOracle`, `riskOracleMiddleware`, `roleManager`, `strategyManager` |
+| Kelp `LRTOracle` | `$admin`, `$implementation`, `lrtConfig` |
+| MakerDAO `MedianGNOUSD` | `slot` |
+
+If you're pruning a token, oracle, or external protocol contract not on this list, use the sqlite grep above to build the list in one pass.
+
 **`ignoreDiscovery: true`** is a different tool — it makes the contract **completely disappear** from `discovered.json`. Only use this in rare cases where a contract truly has no place in the graph (it can't be tagged or analyzed afterward).
 
 **`ignoreRelatives` on a core contract**: Use when a core contract has a specific field pointing to something you don't want discovered at all (e.g., a reference to a deprecated contract). This prevents the target from even appearing in the graph.
@@ -358,6 +430,15 @@ Then add the requested handlers to config.jsonc in the `overrides` section under
 ```
 
 Merge with any existing overrides for that contract.
+
+**Handler outputs become discovery edges — that's the point, don't suppress it by default.** An event handler whose `select` is an address (e.g. `wards`, `accessControl` members, `emissionAdmins`) produces a set of addresses that discovery will then walk as relatives. This is what you want: you added the handler precisely *because* you want those addresses surfaced as nodes in the graph.
+
+Do **not** add `ignoreRelative: true` to the handler as a defensive reflex. Two rules:
+
+1. **If the handler's discovered addresses are protocol-internal** (real admins, operators, role members) → no `ignoreRelative`. Let them land as discovered contracts.
+2. **If the handler's discovered addresses point into a separate external protocol** (e.g. `wards` on a protocol-adjacent contract includes MakerDAO's PauseProxy) → still no `ignoreRelative` on the handler. Instead, prune *at the target external contract itself* using the normal `ignoreRelatives` override from Step 4a. That way the target stays as a named leaf and doesn't drag its network in, which is the outcome you'd want anyway.
+
+The only time `ignoreRelative: true` on a handler is right is when the handler output is a synthetic/derived set that genuinely has no on-chain meaning as a contract graph (very rare).
 
 ---
 

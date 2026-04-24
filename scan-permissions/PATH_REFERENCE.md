@@ -27,6 +27,27 @@ JSONPath-like navigation through the contract's `fields[]` array in discovered.j
 
 The path `$self` (without any value path) means the contract itself is the owner. Use this when a contract's functions are only callable by the contract itself (e.g., via `address(this)` check).
 
+### Hard rule: every path needs a value path (except bare `$self`)
+
+The resolver splits the path on the **first dot** and requires both sides. A bare contract reference with no dot — like `eth:0xAddress` or `@field` — is **invalid syntax** and will not resolve. The only exception is the literal `$self` (special-cased).
+
+**To express "the contract X is the owner"**: pick a field on `$self` whose value is X's address and use it as the value path. For example, if AToken has a `POOL` field that returns the Pool contract address, use `$self.POOL` (NOT bare `eth:0xPoolAddress` — that won't resolve).
+
+### Hard rule: prefer `$self.field` / `@field.subPath` over absolute `eth:0xAddress.subPath`
+
+Absolute addresses are brittle (renames, redeployments, address changes silently break paths and obscure intent). When a field on the current contract points to the target contract, **always** prefer the field-reference form:
+
+| Bad (absolute) | Good (field reference) | Why |
+|---|---|---|
+| `eth:0xPoolAddr` (bare) | `$self.POOL` | Bare absolute is invalid syntax; `$self.POOL` resolves the address from the contract field |
+| `eth:0xCollectorCtrl.owner` | `@getFundsAdmin.owner` | Collector has `getFundsAdmin` pointing to CollectorController |
+| `eth:0xEmissionMgr.owner` | `@EMISSION_MANAGER.owner` | RewardsController has `EMISSION_MANAGER` field |
+| `eth:0xPoolAddrProvider.owner` | `@ADDRESSES_PROVIDER.owner` | Pool has `ADDRESSES_PROVIDER` field |
+
+**When to fall back to absolute `eth:0xAddress.subPath`**: only when the current contract has **no field** pointing to the target. The most common case is multi-hop chains: e.g. AToken needs to reach `ACLManager.accessControl.ROLE.members`, but AToken has no direct ACL field — only `POOL`, and Pool's `ADDRESSES_PROVIDER.getACLManager` would require multi-hop. The path system **only supports one `@field` hop**; chained references like `@field1.@field2` are not valid. In that case, use the absolute path to ACLManager.
+
+**Enforcement during scanning**: when constructing every path, ask "does the current contract have a field whose value equals the absolute address I'm about to write?" If yes, use the field reference. Inspect the contract's `fields[]` (already extracted in Step 2b) — search by address-value match, not just by guessing field names.
+
 ---
 
 ## Solidity Pattern to Path Expression Mapping

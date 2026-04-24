@@ -1,7 +1,6 @@
 ---
 name: generate-governance
 description: Generate a DeFi protocol governance config (governance.json) by researching the protocol and mapping on-chain fields to governance parameters. Sibling of /generate-review but scoped only to governance.
-disable-model-invocation: true
 argument-hint: [project-name]
 allowed-tools: Bash, Read, Write, WebSearch, WebFetch
 ---
