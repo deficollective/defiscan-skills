@@ -142,8 +142,13 @@ Classify each verified URL into one of these types:
   2. Use **WebFetch** on the repo page and look for a license badge/link
   3. Try fetching common paths: `blob/main/LICENSE`, `blob/master/LICENSE`, `blob/main/LICENSE.md`, `blob/main/LICENSE.txt`, `blob/main/COPYING`
   4. Also check the protocol's website footer for license/legal pages
-- Set `label` to the SPDX license identifier: `"MIT"`, `"GPL-3.0"`, `"BUSL-1.1"`, `"Apache-2.0"`, etc.
+- Set `label` to the SPDX license identifier currently in effect: `"MIT"`, `"GPL-3.0"`, `"BUSL-1.1"`, `"Apache-2.0"`, etc.
+  - **If the LICENSE file is dual-licensed or offers a user choice** (e.g. "GPL-2.0-or-later OR BUSL-1.1"), do NOT just copy the dual text into `label`. Verify which license is actually applied by reading the `// SPDX-License-Identifier:` header on a representative source file in the repo (e.g. `src/<MainContract>.sol` for Solidity). The header is authoritative — that's the license currently in effect. Use that single identifier as `label`.
+  - Example: MetaMorpho's LICENSE file says GPL-2.0-or-later OR BUSL-1.1, but every `.sol` file's SPDX header is `GPL-2.0-or-later` — so `label: "GPL-2.0-or-later"`, not a combined string.
 - Set `licenseScope` to describe what the license covers: `"Contracts"`, `"Frontend"`, `"SDK"`, `"Contracts & UI"`, etc.
+  - **Keep it short and clean**: 1–3 words, no parentheses, no extra precisions, no dual-license notes, no repo names. The scope says *what* is covered, not *which variant* or *why*.
+  - Bad: `"Contracts (MetaMorpho, dual-licensed with BUSL-1.1)"`, `"Frontend (UI only, excluding SDK)"`, `"Smart contracts in src/ folder"`
+  - Good: `"Contracts"`, `"Frontend"`, `"SDK"`, `"Contracts & UI"`
 - If the protocol has multiple repos with different licenses (e.g., contracts under BUSL-1.1, frontend under MIT), create **separate** license entries for each
 
 ### DeFiScan V1 (`type: "defiscan-v1"`)
