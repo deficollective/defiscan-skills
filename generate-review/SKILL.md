@@ -265,15 +265,17 @@ For each dependency in `dependencies[]`, PLUS any contract tagged `isExternal: t
 
 ### Funds (`funds`)
 
-For each contract in funds-data that has `balances.totalUsdValue > 0` OR `positions.totalUsdValue > 0`:
+For each contract in funds-data that has `balances.totalUsdValue > 0` OR `positions.totalUsdValue > 0` OR `tokenInfo.tokenValue > 0`:
 
 **Generate `name`:** Contract name from project data + primary token in parentheses (e.g., "ActivePool (wstETH)")
 
 **Generate `description`:**
 - What tokens it holds with a `{{keyName}}` template variable for the USD value (e.g., "Holds {{wstethActivePoolBalance}} in wstETH collateral deposited by borrowers")
-- Create a dataKey entry for each fund contract: map to `fundsdata.contracts["eth:0x..."].balances.totalUsdValue` for token balances, or `.positions.totalUsdValue` for DeFi positions
+- Create a dataKey entry for each fund contract:
+  - For balance contracts: map to `fundsdata.contracts["eth:0x..."].balances.totalUsdValue`
+  - For position contracts: map to `fundsdata.contracts["eth:0x..."].positions.totalUsdValue`
+  - For receipt/deposit tokens: map to `fundsdata.contracts["eth:0x..."].tokenInfo.tokenValue`
 - If a contract has both balances and positions, create separate dataKeys for each
-- For token contracts, create a dataKey for market cap via `.tokenInfo.tokenValue`
 - What role the contract plays in the protocol (collateral pool, stability pool, treasury, etc.)
 - If it has DeFi positions, mention which protocols
 
