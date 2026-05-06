@@ -143,11 +143,9 @@ curl -s -X PUT "localhost:2021/api/projects/$0/contract-tags" \
 
 ### 5. Verify the cap resolves
 
-After every cap added, recompile + check `effectiveCapUsd` propagates to the admin's reach:
+After every cap added, query `/admins` and check `effectiveCapUsd` propagates to the admin's reach. The endpoint reads `ProjectAnalysis` live from `permission-overrides.json` + `discovered.json` + `funds-data.json`, so no `compile-review` is needed here — `compile-review` only refreshes the static `compiled-review.json` consumed by the frontend, and isn't relevant to the verification.
 
 ```bash
-curl -s -X POST "localhost:2021/api/projects/$0/compile-review" > /dev/null
-
 curl -s "localhost:2021/api/projects/$0/admins" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
