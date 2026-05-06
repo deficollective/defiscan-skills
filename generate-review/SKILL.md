@@ -1,7 +1,7 @@
 ---
 name: generate-review
 description: Generate a DeFi protocol security review from analysis data. Fetches pre-processed data from the l2b API and writes structured review content for review-config.json.
-disable-model-invocation: true
+disable-model-invocation: false
 argument-hint: [project-name]
 allowed-tools: Bash, Read, Write
 ---
@@ -20,19 +20,45 @@ The l2b UI server must be running at `http://localhost:2021`. If not, tell the u
 
 ---
 
-## Step 0: Remove Existing Review
+## Step 0: Remove Existing Review (preserve out-of-band state)
 
-Move the existing config out of the way so the review is generated from scratch.
+Move the existing config out of the way so the review is generated from scratch — but first **extract `publishedAt` and `verified`** to side files so they survive the regen. These are out-of-band fields:
+
+- `publishedAt` is set once on creation and must persist forever.
+- `verified` is the researcher attestation flag. **Regen preserves the prior value** — if a researcher previously marked the protocol Verified, regenerating the AI content keeps that attestation. **First-time creation** (no prior file) defaults to `false` (Unverified).
 
 ```bash
 CONFIG_PATH="packages/config/src/projects/$0/review-config.json"
+PUBLISHED_AT_FILE="/tmp/review-config-$0-publishedAt.txt"
+VERIFIED_FILE="/tmp/review-config-$0-verified.txt"
+rm -f "$PUBLISHED_AT_FILE" "$VERIFIED_FILE"
+
 if [ -f "$CONFIG_PATH" ]; then
+  python3 -c "
+import json
+d = json.load(open('$CONFIG_PATH'))
+pa = d.get('publishedAt')
+if pa:
+    open('$PUBLISHED_AT_FILE', 'w').write(pa)
+v = d.get('verified')
+if isinstance(v, bool):
+    open('$VERIFIED_FILE', 'w').write('true' if v else 'false')
+"
   mv "$CONFIG_PATH" "/tmp/review-config-backup-$0.json"
   echo "Moved existing review-config.json to /tmp/review-config-backup-$0.json"
+  [ -f "$PUBLISHED_AT_FILE" ] && echo "Preserved publishedAt=$(cat $PUBLISHED_AT_FILE)"
+  [ -f "$VERIFIED_FILE" ] && echo "Preserved verified=$(cat $VERIFIED_FILE)"
 else
-  echo "No existing review-config.json found"
+  echo "No existing review-config.json found — first-time creation, verified will be set to false"
 fi
 ```
+
+**Use these preserved values when writing the final config in Step 4:**
+- If `$PUBLISHED_AT_FILE` exists: set `publishedAt` to its contents.
+- If `$VERIFIED_FILE` exists: set `verified` to its boolean contents (`true` or `false`).
+- If `$VERIFIED_FILE` does NOT exist (first-time creation): set `verified: false`.
+
+Never read other fields from the backup — only `publishedAt` and `verified`.
 
 ---
 
@@ -41,14 +67,38 @@ fi
 ### 1a. Fetch raw data (run all curl commands in parallel)
 
 ```bash
-curl -s localhost:2021/api/projects/$0 > /tmp/review-project-raw.json
-curl -s localhost:2021/api/projects/$0/admins > /tmp/review-admins.json
-curl -s localhost:2021/api/projects/$0/dependencies > /tmp/review-dependencies.json
-curl -s localhost:2021/api/projects/$0/contract-tags > /tmp/review-tags.json
-curl -s localhost:2021/api/projects/$0/funds-data > /tmp/review-funds.json
-curl -s localhost:2021/api/projects/$0/functions > /tmp/review-functions.json
-curl -s localhost:2021/api/projects/$0/enhanced-traversal > /tmp/review-traversal-raw.json
+curl -s localhost:2021/api/projects/$0 > /tmp/review-project-raw.json &
+curl -s localhost:2021/api/projects/$0/admins > /tmp/review-admins.json &
+curl -s localhost:2021/api/projects/$0/dependencies > /tmp/review-dependencies.json &
+curl -s localhost:2021/api/projects/$0/contract-tags > /tmp/review-tags.json &
+curl -s localhost:2021/api/projects/$0/funds-data > /tmp/review-funds.json &
+curl -s localhost:2021/api/projects/$0/functions > /tmp/review-functions.json &
+curl -s localhost:2021/api/projects/$0/enhanced-traversal > /tmp/review-traversal-raw.json &
+wait
 ```
+
+### 1a-bis. Detect the project's chain prefix
+
+**CRITICAL:** the chain prefix used in admin/dep/funds keys and dataKeys must match the actual chain (`eth:`, `base:`, `arb1:`, `optimism:`, `polygon:`, etc.). Hard-coding `eth:` produces silently broken output — the compiler falls back to auto-generated names without raising any error.
+
+Detect the chain from `discovered.json.entries[0].address`:
+
+```bash
+CHAIN=$(python3 -c "
+import json
+d = json.load(open('/tmp/review-project-raw.json'))
+addrs = []
+for e in d.get('entries', []):
+    for c in e.get('initialContracts', []) + e.get('discoveredContracts', []):
+        if ':' in c.get('address',''):
+            addrs.append(c['address'].split(':')[0])
+            break
+    if addrs: break
+print(addrs[0] if addrs else 'eth')")
+echo "Detected chain prefix: $CHAIN"
+```
+
+**Use `$CHAIN:0x...` for ALL keys in `admins`, `dependencies`, `funds`, and `dataKeys` paths.** Never hard-code `eth:`.
 
 ### 1b. Preprocess large files into compact summaries
 
@@ -152,6 +202,8 @@ Read these files using the Read tool:
 6. `/tmp/review-functions.json` — permissioned functions with descriptions
 7. `/tmp/review-traversal.json` — terminal owners per function (enrichment, may be empty)
 
+**For naming admins** (Section 3 below), you'll also need to search the *raw* discovered file to find which on-chain fields and AccessControl roles reference each admin's address — that's where the protocol's own name for the admin lives. Keep `packages/config/src/projects/$0/discovered.json` available to grep against; the compact project summary above only shows fields ON each contract, not the backlinks needed for naming. Also keep `packages/config/src/projects/$0/resources.json` open so you can cross-check the protocol's published address book / docs when an on-chain role name is missing or ambiguous.
+
 If any core file (admins, dependencies, project, tags, funds, functions) is empty or contains an error, stop and report which data is missing.
 
 ---
@@ -211,7 +263,8 @@ interface ReviewConfig {
   protocolSlug: string         // The project directory name ($0)
   protocolName: string         // Human-readable (e.g., "Liquity V2")
   tokenName: string            // From funds-data tokenInfo (e.g., "BOLD")
-  chain: "Ethereum"            // Default
+  chain: string                // Human-readable chain name: "Ethereum" | "Base" | "Arbitrum" | "Optimism" | "Polygon"
+                               // Map from $CHAIN: eth→Ethereum, base→Base, arb1→Arbitrum, optimism→Optimism, polygon→Polygon
   projectType: 'stablecoin' | 'lending' | 'dex' | 'bridge' | 'derivatives' | 'yield' | 'liquid-staking' | 'cdp' | 'other'
   description: string
   admins: Record<string, { name?: string; description: string }>
@@ -237,12 +290,31 @@ Base this on contract names, token info, dependencies, and the overall architect
 
 For each admin in `admins[]` (skip those with `isExternal: true` — they belong to dependencies):
 
-**Generate a human-readable `name`:**
-- **Multisig**: Find the contract in project data, look at `keyFields.multisigThreshold` (e.g., "3 of 5 (60%)"). Format: `"{Protocol} Team {N}/{M} Multisig"` or `"Governance {N}/{M} Multisig"`
-- **EOA**: Format: `"EOA (0x{first4}...{last4})"`
-- **Timelock**: Find delay in `keyFields`. Format: `"Governance Timelock ({delay})"` where delay is human-readable (e.g., "48h", "7d")
-- **Revoked** (type is "Revoked" or zero address): `"Zero Address (Renounced)"`
-- **Internal contract** (type is Contract/Untemplatized with no external admin): Use the contract name directly. If it's an internal protocol contract that isn't externally controlled, explain it's a protocol-level permission (contract-to-contract call restriction, not a human admin)
+**Generate a human-readable `name` — use the protocol's own term first, threshold/shape second.** A name like `"5 of 9 (56%) Multisig"` tells the reader nothing — the report still has to answer "what is this multisig allowed to do?" Researchers and end-users orient on roles, not signer counts. The compiler's auto-generated `"N of M (X%) Safe"` fallback is exactly the bad name we're replacing; never accept it.
+
+**Step 1 — Find the protocol's own name for the admin (mandatory before formatting).**
+
+Discovery captures every reference to the admin's address. Search those references for the *most semantic* role label the protocol uses, in this order:
+
+1. **AccessControl role members** — search `accessControl.<ROLE>.members` arrays in `discovered.json` for the admin address. The role name (e.g. `EMERGENCY_ADMIN_ROLE`, `RISK_COUNCIL_ROLE`, `BUCKET_MANAGER_ROLE`, `PAUSE_GUARDIAN_ROLE`, `DEFAULT_ADMIN_ROLE`) is what the protocol *itself* calls this address. Strip the `_ROLE` suffix and Title-Case it: `EMERGENCY_ADMIN_ROLE` → "Emergency Admin", `RISK_COUNCIL_ROLE` → "Risk Council", `BUCKET_MANAGER_ROLE` → "Bucket Manager".
+2. **Named field references** — grep the admin's address across all discovered values. Roles often live in immutable fields with self-documenting names: `guardian`, `RISK_COUNCIL`, `EMERGENCY_ADMIN`, `pendingOwner`, `pauser`, `feeRecipient`, `treasury`. The field name on the *referencing* contract tells you what role this address plays. `Governance.guardian = X` → X is the "Guardian"; `Steward.RISK_COUNCIL = X` → X is the "Risk Council".
+3. **Protocol resources** — if `resources.json` lists docs / governance forum / address book, and the admin still has no clear on-chain label (or holds multiple roles), check the docs for the canonical name. Aave publishes an "Address Book" naming each multisig (`Aave Guardian`, `Aave Protocol Emergency Guardian`, `GHO Risk Council`); MakerDAO lists "Pause Proxy", "ESM Authority"; Compound names "Pause Guardian", "Comptroller Admin"; etc.
+4. **Owner-of-X fallback** — if the admin only appears as `owner` of a single named contract and nothing else, name it after what it owns: e.g. an EOA that's only the `owner` of `RewardsVault` becomes "RewardsVault Owner".
+
+If multiple roles found, prefer the most specific / most consequential one. If the address holds `EMERGENCY_ADMIN_ROLE` on one ACLManager AND `DEFAULT_ADMIN_ROLE` on a related contract, name it after the more powerful + more semantic role; mention the other in the description.
+
+**Step 2 — Format the name with the protocol-given role first, threshold second.**
+
+- **Multisig**: `"{ProtocolName-or-Scope} {Role} ({N}-of-{M} Multisig)"`. The role comes from Step 1; the threshold/percentage is a parenthetical qualifier, never the headline.
+  - Good: `"Aave Guardian (5-of-9 Multisig)"`, `"GHO Risk Council (3-of-4 Multisig)"`, `"Spark Pause Proxy (2-of-3 Multisig)"`, `"Frankencoin Stablecoin Bridge Operators (4-of-7 Multisig)"`.
+  - Reject: `"5 of 9 (56%) Multisig"`, `"Multisig"`, `"3/5 Safe"`. These give the reader nothing to anchor on.
+  - Include the protocol/scope only when ambiguous within the project (e.g. an Aave deployment with multiple market-specific multisigs needs `"Horizon Admin"`, not just `"Admin"`); skip the protocol prefix on protocols with a single signer set.
+- **EOA**: prefer the role name if Step 1 found one (e.g. `"RewardsVault Owner (EOA)"`). Only fall back to `"EOA (0x{first4}...{last4})"` when the EOA holds no named role.
+- **Timelock / governance executor**: name from Step 1 (e.g. `"DSPause"`, `"Aave Governance V3 Executor"`, `"PayloadsController Executor"`) plus the delay as a parenthetical: `"Compound GovernorBravo Timelock (2-day delay)"`. Don't default to `"Governance Timelock ({delay})"` — that's the compiler's fallback and ignores what the protocol actually calls it.
+- **Renounced / Revoked**: `"Zero Address (Renounced)"`. (One of the few cases where the compiler-style label is right — there is no protocol-given name to recover.)
+- **Internal contract** (no external admin path, contract-level permission only): use the contract's discovered name; in the description make clear this is a protocol-internal call gate, not a human-controlled admin. If the contract is itself a well-known protocol-named entity (e.g. `"PoolConfigurator"`, `"PayloadsController"`), keep the protocol's spelling exactly as the source code defines it — don't reformat to a generic "configuration manager."
+
+**Step 3 — Do not invent names the protocol doesn't use.** If the admin has a role that doesn't map cleanly to a public protocol term, lean on Step 1's role-from-AccessControl over a freshly-coined description. A name a developer can grep for in the protocol's source / docs is far more useful than a name the researcher made up. When in doubt, copy the role identifier verbatim.
 
 **Generate `description`:**
 - List what permissioned functions this admin controls, grouped thematically (e.g., "Can pause deposits and withdrawals", "Can upgrade the price oracle")
@@ -250,7 +322,7 @@ For each admin in `admins[]` (skip those with `isExternal: true` — they belong
 - If the admin is revoked, note the permission is effectively renounced
 - If the admin is an internal contract and the traversal shows no EOA/Multisig terminals, explain this is an internal access control mechanism (not a human-controlled permission)
 
-**Address format**: Always use `eth:0x...` prefix with ERC-55 checksummed hex (e.g., `eth:0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2`).
+**Address format**: Always use the project's chain prefix (`$CHAIN:` from Step 1a-bis) with ERC-55 checksummed hex (e.g., `base:0xeE8F4eC5672F09119b96Ab6fB59C27E1b7e44b61`). Hard-coding `eth:` on a non-Ethereum project causes the compiler to silently fall through to auto-generated names ("3/7 43% SafeL2") with no error, so this is **the** most important detail to get right.
 
 ### Dependencies (`dependencies`)
 
@@ -324,7 +396,7 @@ packages/config/src/projects/$0/review-config.json
 Then clean up temporary files:
 
 ```bash
-rm -f /tmp/review-project-raw.json /tmp/review-admins.json /tmp/review-admins-compact.json /tmp/review-dependencies.json /tmp/review-dependencies-compact.json /tmp/review-traversal-raw.json /tmp/review-project.json /tmp/review-tags.json /tmp/review-funds.json /tmp/review-functions.json /tmp/review-traversal.json /tmp/review-config-backup-$0.json
+rm -f /tmp/review-project-raw.json /tmp/review-admins.json /tmp/review-admins-compact.json /tmp/review-dependencies.json /tmp/review-dependencies-compact.json /tmp/review-traversal-raw.json /tmp/review-project.json /tmp/review-tags.json /tmp/review-funds.json /tmp/review-functions.json /tmp/review-traversal.json /tmp/review-config-backup-$0.json /tmp/review-config-$0-publishedAt.txt /tmp/review-config-$0-verified.txt
 ```
 
 Report what was generated:
@@ -353,7 +425,7 @@ Report what was generated:
 
 - **Concise**: 1-3 sentences per entity description, 2-4 sentences for the protocol description. No filler
 - **Specific**: Use exact contract names and function names when available
-- **Address format**: Short form in text (0xAbCd...1234) but full `eth:0x...` in JSON keys
+- **Address format**: Short form in text (0xAbCd...1234) but full `$CHAIN:0x...` in JSON keys (use the chain detected in Step 1a-bis, never hard-code `eth:`)
 
 ---
 
@@ -395,14 +467,14 @@ Use `{{keyName}}` in any description string (protocol description, admins, depen
 
 ### dataKeys Format
 
-Each entry in `dataKeys` maps a key name to a **raw API response path** — the exact JSON path to the value in the API response:
+Each entry in `dataKeys` maps a key name to a **raw API response path** — the exact JSON path to the value in the API response. **The chain prefix in the path key MUST match the project's actual chain (`$CHAIN:0x...`)** — `eth:` paths on a `base:` project resolve to `undefined` and the template variable renders as a literal `{{keyName}}`:
 
 ```json
 {
   "dataKeys": {
     "wstethActivePoolBalance": "fundsdata.contracts[\"eth:0x531a8f99c70d6a56a7cee02d6b4281650d7919a0\"].balances.totalUsdValue",
     "boldMarketCap": "fundsdata.contracts[\"eth:0x6440f144b7e50d6a8439336510312d2f54beb01d\"].tokenInfo.tokenValue",
-    "vaultPositionsTotal": "fundsdata.contracts[\"eth:0xbeef01735c132ada46aa9aa4c54623caa92a64cb\"].positions.totalUsdValue"
+    "vaultPositionsTotal": "fundsdata.contracts[\"base:0xbeef01735c132ada46aa9aa4c54623caa92a64cb\"].positions.totalUsdValue"
   }
 }
 ```

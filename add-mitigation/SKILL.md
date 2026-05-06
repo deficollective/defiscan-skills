@@ -66,8 +66,25 @@ Many `require`/`if` checks in permissioned functions are **sanity/invariant guar
 - **Self-rotation guards** (`require(_newManager != address(this))`). Sanity, not risk-limiting.
 - **Initialization one-shot guards** (`require(initializedAt == 0)`). These make the score `no-impact` (the owner is already consumed), not a mitigation.
 - **Array length equality checks**, **non-empty array checks**, **reentrancy guards** — protocol-correctness plumbing, not fund-impact bounds.
+- **Permission-restating labels of any kind** — `<role>-gated`, `<contract>-gated`, `governance-gated`, `governance-or-multisig`, `only<X>`. These restate `ownerDefinitions` in mitigation form. The smell: the description says "callable only by X" without naming a numeric or temporal bound on what X can do. If the function genuinely *needs* one of these labels, the right action is usually to score `no-impact` (when X is the legitimate caller and there's no extraction path) — not to write the access modifier as a mitigation. A 552-mitigation cleanup in 2026-05 stripped this exact family from a single project; they pollute every entity card without bounding anything.
 
-Rule of thumb: state the mitigation as *"Because of this constraint, the caller cannot move/drain/dilute more than X"*. If the sentence doesn't finish naturally, it's not a mitigation — drop it.
+Rule of thumb: state the mitigation as *"Because of this constraint, the caller cannot move/drain/dilute more than X"*. If the sentence doesn't finish naturally with a number or a duration, it's not a mitigation — drop it.
+
+#### Calibration: when the function looks "future-only" but isn't
+
+The single most common scoring error is calling a state-flag setter `future-only` when the flag is actually checked on a user-exit path. **Don't trust the flag's name** — protocols use `paused` / `frozen` / `halted` / `stopped` / `locked` / `inactive` / `disabled` interchangeably and sometimes invertedly. The only reliable signal is the flag's read sites. Grep the flag across the protocol's `validate*` / `_check*` / inline-`require` paths and classify by what's blocked:
+
+- **Blocks user-exit operations** (withdraw, redeem, repay, claim, transfer, liquidate) → committed funds become inaccessible for the duration → `critical` with a `lock-bound` (or similar) mitigation capped at affected pool/vault TVS.
+- **Blocks user-entry operations only** (supply, deposit, borrow, mint) → existing positions wind down cleanly → `no-impact` with `future-only`.
+- **Blocks both entry and exit** → same as exit-blocking → `critical`.
+
+*Concrete instance:* in Aave V3, `setReservePause` reads in `validateWithdraw`/`validateRepay`/`validateLiquidationCall` (exit-blocking → `critical`); `setReserveFreeze` reads only in `validateSupply`/`validateBorrow` (entry-only → `no-impact`). Same protocol, same admin, opposite scores. The same shape exists with different naming across many lending and vault protocols — verify by reading the read sites, not by name-matching.
+
+Other shape calibrations worth knowing:
+
+- **Cancel / veto functions** (any DAO `cancelProposal`-style, any timelock `cancel(payloadId)`-style, emergency-veto multisigs). Flip a `Cancelled`/`Vetoed` state and emit an event — they don't execute the cancelled action. Score `no-impact` with a `veto-only` / `payload-veto` / `proposal-veto` label even when call-graph BFS attaches large reach (the cancel and the execute often share a contract).
+- **Token-rescue functions with an explicit underlying-asset guard** — `require(token != <underlyingAsset>)` or equivalent — can only sweep ERC-20s mistakenly sent to the contract. Score `no-impact` with a `mistakenly-sent only` label and quote the require. The same shape sometimes exists *without* the require but with an architectural invariant (deposits route directly to per-asset wrappers, so the rescuing contract custodies nothing). Verify the invariant from the deposit-path source before applying.
+- **Hook / controller-swap functions** that change which contract receives event hooks (reward-accounting controller, fee-distribution target, accounting bookkeeper). The hook is consulted on transfer/mint/burn for bookkeeping; principal stays in the original contract's own balance accounting. Score `no-impact` with a `no-principal-path` label. Worst-case effects of a malicious hook (revert callback → DoS, divert future rewards) are operational and recoverable; neither extracts committed funds.
 
 ### Phase 3: Present findings
 

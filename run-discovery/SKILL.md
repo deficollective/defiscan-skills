@@ -180,10 +180,10 @@ For each selected item, add the field name to `ignoreMethods` on the correspondi
 - Group methods by contract address — don't create duplicate override entries
 - **Use the exact address from the grouped output** (full address, not shortened)
 
-After applying, re-run discovery once before proceeding to classification:
+After applying, re-run discovery once before proceeding to classification. Use `--dev` so the run pins to the timestamp saved in `discovered.json` from Step 1 — this keeps RPC cache hits and saves API quota:
 
 ```bash
-cd packages/config && l2b discover $0 2>&1 | tee /tmp/discovery-$0-output.txt
+cd packages/config && l2b discover $0 --dev 2>&1 | tee /tmp/discovery-$0-output.txt
 ```
 
 Re-fetch project data as in Step 1b.
@@ -309,6 +309,19 @@ cat packages/config/src/projects/$0/config.jsonc
 ```
 
 Add overrides for external contracts. Use the Write tool to write the updated config.
+
+**⚠ Footgun: never add a second top-level entry for an address that already has one.** `config.jsonc` is parsed as JSON; duplicate object keys silently overwrite earlier entries (last-key-wins). If the file already contains `"<chain>:0xABCD…": { fields: { existing: ... } }` and you append a new `"<chain>:0xABCD…": { fields: { newField: ... } }` block lower down, **every other field on the existing entry — including event handlers, access-control handlers, ignoreRelatives lists, ignoreInWatchMode entries, and any per-field handlers from earlier configuration work — is erased without warning.** Discovery then silently drops any contract that was reachable only through those handlers. *Concrete instance:* in 2026-05 four oracle-router entries had their `assetSources` event handler overwritten by an appended block adding a single new field, dropping ~100 downstream price-feed contracts (Chainlink aggregators, price-cap adapters, synchronicity wrappers) from discovery and silently zeroing the project's oracle-dependency reach in the compiled review.
+
+Always **grep for the address first**, then **merge** new fields into the existing block:
+
+```bash
+# Before adding any override, check whether the address already has one:
+grep -n '"<chain>:0xABCD' packages/config/src/projects/$0/config.jsonc
+# If count > 0, scroll to that line and add fields INTO the existing
+# `fields: { ... }` object. Don't add a second top-level key.
+```
+
+When you must add a new override entry: add it once, in the alphabetical position it belongs (the file is roughly sorted by address). Don't append at the bottom of `overrides: { ... }` — appending is the failure mode that produces duplicates.
 
 **Pruning external contracts:**
 
@@ -456,8 +469,10 @@ Update config.jsonc with the new maxDepth value.
 
 ### 5b. Re-run discovery
 
+Use `--dev` to pin the run to the timestamp in `discovered.json` and reuse cached RPC responses:
+
 ```bash
-cd packages/config && l2b discover $0 2>&1 | tee /tmp/discovery-$0-output.txt
+cd packages/config && l2b discover $0 --dev 2>&1 | tee /tmp/discovery-$0-output.txt
 ```
 
 Re-fetch project data:

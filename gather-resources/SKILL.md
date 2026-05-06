@@ -53,15 +53,46 @@ Record every potentially useful URL you find.
 
 **ICON_DIR** (relative to repo root): `packages/defiscan-frontend/public/protocols/`
 
-From the website fetched in Step 1, locate the protocol's logo and download it into `ICON_DIR` with filename `$0.svg` (preferred) or `$0.png` (fallback). Use `curl` via Bash.
+From the website fetched in Step 1, locate the protocol's logo and download it into `ICON_DIR` with filename `$0.png` (square icon, preferred) or `$0.svg` (only if confirmed square). Use `curl` via Bash.
 
-Search order on the page's HTML:
-1. `<link rel="icon" type="image/svg+xml" href="...">` — save as `$0.svg`
-2. `<link rel="apple-touch-icon" href="...">` — usually 180×180 PNG, save as `$0.png`
-3. `<meta property="og:image" content="...">` — save as `$0.png` (only if it clearly shows the protocol mark, not a generic banner)
-4. `/favicon.svg` or `/favicon.ico` at the site root — save as `$0.svg` if SVG, otherwise skip
+**Square-only — wordmark logos are unusable.** Protocol cards display the logo in a small square container. A 200×40 wordmark SVG (common on landing pages) renders as a tiny illegible strip and ruins card layout. Always prefer a square icon.
 
-If the URL is relative, resolve it against the website origin. If nothing suitable is found, skip — the frontend has a default fallback. Do not convert formats; save whatever extension you downloaded (only `.svg` or `.png` are used by the frontend).
+Search order on the page's HTML (apple-touch-icon first because it is **always square** by spec):
+
+1. `<link rel="apple-touch-icon" href="...">` — always square, usually 180×180 or 256×256 PNG. Save as `$0.png`. **First choice.**
+2. `<link rel="icon" type="image/svg+xml" href="...">` — save as `$0.svg` **only after verifying the SVG `viewBox` is square or near-square** (width / height ratio between 0.5 and 2.0). If it's a wordmark (ratio > 2), skip and try the next source.
+3. `/favicon.svg` or `/favicon.ico` at the site root — same square check as above; save `$0.svg` if SVG and square, otherwise skip.
+4. `<meta property="og:image" content="...">` — usually 1200×630 (banner aspect) — **almost never usable**. Only consider if it visibly shows just the protocol mark on a square crop.
+
+After downloading, **always sanity-check the aspect ratio** before committing:
+
+```bash
+# For PNG:
+python3 -c "
+import struct, sys
+data = open('/tmp/logo-candidate.png','rb').read()
+w = struct.unpack('>I', data[16:20])[0]
+h = struct.unpack('>I', data[20:24])[0]
+ratio = max(w,h) / min(w,h)
+print(f'{w}x{h}, ratio={ratio:.2f}')
+sys.exit(0 if ratio < 2.0 else 1)"
+
+# For SVG: parse viewBox or width/height
+python3 -c "
+import re
+src = open('/tmp/logo-candidate.svg').read()
+m = re.search(r'viewBox=[\"\\']([^\"\\']+)', src) or re.search(r'width=[\"\\'](\d+)[^\"]*[\"\\'].*?height=[\"\\'](\d+)', src)
+if not m: print('no dims'); exit(1)
+parts = m.group(1).split() if 'viewBox' in src else m.groups()
+w, h = float(parts[-2]), float(parts[-1])
+ratio = max(w,h) / min(w,h)
+print(f'{w}x{h}, ratio={ratio:.2f}')
+exit(0 if ratio < 2.0 else 1)"
+```
+
+If aspect ratio > 2:1, **discard and try the next source**. Do not save a wordmark as the protocol logo — it's worse than the default fallback.
+
+If the URL is relative, resolve it against the website origin. If nothing suitable is found across all four sources, skip — the frontend has a default fallback. Only `.svg` or `.png` are used by the frontend.
 
 ### Resize PNG to 128×128
 
