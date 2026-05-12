@@ -188,8 +188,9 @@ Write a **user-facing digest** of today's real changes — the output that gets 
 - The concrete facts a user needs to understand the change: what was added/changed/swapped, in what direction, relative to what was there before
 - For multisigs: the old/new signer count and whether the threshold changed (these are facts, not judgements)
 - For new markets / parameter changes: the previous state and the new state, so the reader can size the delta themselves
+- **Activity-page link** for every protocol section. URL pattern: `https://defiscan.info/protocol/<slug>?view=activity` where `<slug>` is the directory name under `packages/config/src/projects/` (case-sensitive — e.g. `Steakhouse-USDC`, `aave-v3`). Drop it on its own line directly under the protocol's text — Telegram auto-linkifies bare URLs, so no markdown is needed.
 
-**Format — plaintext for Telegram (no markdown).** The digest is copy-pasted directly into the Telegram app, which renders no markdown — `#`, `*`, `**`, `_` all show up literally. Use only blank lines and ALL-CAPS protocol names for visual structure. Never use `#`, `*`, `**`, `_`, backticks, or any other markdown syntax. Don't quote field paths or addresses.
+**Format — plaintext for Telegram (no markdown).** The digest is copy-pasted directly into the Telegram app, which renders no markdown — `#`, `*`, `**`, `_` all show up literally. Use only blank lines and ALL-CAPS protocol names for visual structure. Never use `#`, `*`, `**`, `_`, backticks, or any other markdown syntax. Don't quote field paths or addresses. Bare `https://…` URLs are fine — Telegram turns them into clickable links automatically.
 
 ```
 DeFi Digest — <today, written friendly e.g. "May 4, 2026">
@@ -198,9 +199,11 @@ DeFi Digest — <today, written friendly e.g. "May 4, 2026">
 
 <PROTOCOL NAME IN ALL CAPS>
 <1-3 factual sentences. What changed, what it was before, what it is now.>
+https://defiscan.info/protocol/<slug>?view=activity
 
 <PROTOCOL NAME IN ALL CAPS>
-...
+<...>
+https://defiscan.info/protocol/<slug>?view=activity
 ```
 
 The title is always `DeFi Digest` — never `DeFi Daily` (the routine isn't guaranteed to run daily). Separate sections with one blank line. No bullet points, no dashes-as-bullets, no horizontal rules.

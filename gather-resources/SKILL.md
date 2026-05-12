@@ -118,7 +118,7 @@ Use **WebSearch** to find resources that may not be linked from the initial page
 2. `"<protocol name>" site:x.com OR site:twitter.com` — find X/Twitter account
 3. `"<protocol name>" DeFi documentation docs` — find documentation
 4. `"<protocol name>" DeFi app frontend interface` — find frontends (official and third-party like DeFi Saver, Instadapp, etc.)
-5. `"<protocol name>" site:defiscan.info` — find DeFiScan V1 report
+5. `"<protocol name>" site:v1.defiscan.info` — find DeFiScan V1 report
 
 For each search, evaluate results carefully. Only use results that clearly belong to the correct protocol — watch out for name collisions with unrelated projects.
 
@@ -183,7 +183,7 @@ Classify each verified URL into one of these types:
 - If the protocol has multiple repos with different licenses (e.g., contracts under BUSL-1.1, frontend under MIT), create **separate** license entries for each
 
 ### DeFiScan V1 (`type: "defiscan-v1"`)
-- URL format: `https://www.defiscan.info/protocols/<project-slug>/ethereum`
+- URL format: `https://v1.defiscan.info/protocols/<project-slug>/ethereum`
 - Use **WebFetch** to verify this URL exists (DeFiScan V1 may not have a report for every protocol)
 - The project slug is usually `$0` but may differ — check search results
 
