@@ -155,6 +155,8 @@ curl -s -X PUT localhost:2021/api/projects/<slug>/functions \
   }'
 ```
 
+> ⚠ **Do NOT set a function-level `delay` field on ANY timelocked function** (`submitCap`, `submitTimelock`, `submitGuardian`, `submitMarketRemoval`, `submitFee`, …). The 7-day MetaMorpho timelock is a *relationship constraint* between the caller (curator/owner) and the function — anchor it as an **edge mitigation** in [Step 7c](#step-7c--anchor-the-7-day-timelock-as-an-edge-mitigation). Setting `func.delay` causes `buildMergedMitigations` to auto-synthesize a phantom delay mitigation that propagates onto every downstream dependency row (Morpho Blue, Chainlink feeds, etc.).
+
 ### `submitTimelock` (owner, delay-protected, capped 1..14 days)
 
 ```bash
@@ -166,7 +168,6 @@ curl -s -X PUT localhost:2021/api/projects/<slug>/functions \
     "isPermissioned": true,
     "score": "no-impact",
     "ownerDefinitions": [{"path":"$self.owner"}],
-    "delay": {"contractAddress":"<vault-checksum>","fieldName":"timelock"},
     "mitigations": [{
       "type": "valueRange",
       "description": "Timelock can only be set in [1, 14] days",
@@ -185,8 +186,7 @@ curl -s -X PUT localhost:2021/api/projects/<slug>/functions \
     "functionName": "submitGuardian",
     "isPermissioned": true,
     "score": "no-impact",
-    "ownerDefinitions": [{"path":"$self.owner"}],
-    "delay": {"contractAddress":"<vault-checksum>","fieldName":"timelock"}
+    "ownerDefinitions": [{"path":"$self.owner"}]
   }'
 ```
 
@@ -200,12 +200,11 @@ curl -s -X PUT localhost:2021/api/projects/<slug>/functions \
     "functionName": "submitCap",
     "isPermissioned": true,
     "score": "unscored",
-    "ownerDefinitions": [{"path":"$self.curator"},{"path":"$self.owner"}],
-    "delay": {"contractAddress":"<vault-checksum>","fieldName":"timelock"}
+    "ownerDefinitions": [{"path":"$self.curator"},{"path":"$self.owner"}]
   }'
 ```
 
-Same shape with `submitMarketRemoval`.
+Same shape with `submitMarketRemoval`. Both functions' timelock is anchored via the edge-mitigation rule in [Step 7c](#step-7c--anchor-the-7-day-timelock-as-an-edge-mitigation).
 
 ### Allocator / curator / owner (no delay)
 
@@ -330,7 +329,9 @@ done
 
 ### Merging deps into `submitCap` / `acceptCap` (Step 7)
 
-**PUT replaces** — to add Chainlink deps + per-feed `impactCap` mitigations to `submitCap` (Step 7), re-send the full payload preserving the score, ownerDefinitions, delay, and original delay-mitigation. Use this template:
+**PUT replaces** — to add Chainlink deps + per-feed `impactCap` mitigations to `submitCap` (Step 7), re-send the full payload preserving the score, ownerDefinitions, and delay. Use this template:
+
+> ⚠ **Do NOT prepend a function-level `delay` mitigation here.** The MetaMorpho 7-day timelock is a *relationship constraint* (it gates the curator/owner's path to `submitCap`), not a function-intrinsic constraint. Anchoring it on the function makes it propagate as a spurious 7-day delay onto every downstream view-read (Morpho Blue, Chainlink feeds, …) because the dependency view aggregates all function-level mitigations. Author it as an **edge mitigation** in `call-graph-overrides.json` instead — see the next section. The function-level `delay` field (separate from the `mitigations[]` array) is kept for admin-view sort/display.
 
 ```bash
 VAULT="<chain>:0xVAULT..."
@@ -350,22 +351,21 @@ MITS='[
   // ... one entry per feed ...
 ]'
 
-# submitCap: preserve score + ownerDefinitions + delay, prepend the original delay mitigation
+# submitCap: preserve score + ownerDefinitions. NO function-level `delay` field
+# and NO function-level delay mitigation — the timelock is anchored on the
+# (owner→submitCap) permission edges in Step 7c.
 curl -s -X PUT localhost:2021/api/projects/<slug>/functions \
   -H 'Content-Type: application/json' \
   -d "$(python3 -c "
 import json
-mits = json.loads('''$MITS''')
-delay_mit = {'type':'delay','description':'Delay before execution','delayRef':{'contractAddress':'$VAULT','fieldName':'timelock'}}
 print(json.dumps({
     'contractAddress':'$VAULT',
     'functionName':'submitCap',
     'isPermissioned':True,
     'score':'unscored',
     'ownerDefinitions':[{'path':'\$self.curator'},{'path':'\$self.owner'}],
-    'delay':{'contractAddress':'$VAULT','fieldName':'timelock'},
     'dependencies': json.loads('''$DEPS'''),
-    'mitigations': [delay_mit] + mits
+    'mitigations': json.loads('''$MITS''')
 }))"
 )"
 
@@ -385,6 +385,79 @@ print(json.dumps({
 ```
 
 **Critical schema reminder:** `impactCap` accepts only the new shape — `{value: {mode: "hardcoded"|"fieldRef", ...}, unit: {kind: "usd"|"scaler"|"token", ...}}`. The legacy form `{value: "200000000", unit: "usd"}` (plain strings) silently does **not** resolve and the cap won't bind. Use `unit: {kind: "scaler", factor: "1e6"}` for USDC vaults; switch the factor to `"1e8"` for cbBTC, `"1e18"` for WETH/DAI, etc.
+
+### Step 7c — anchor the 7-day timelock as EDGE mitigations (every timelocked function)
+
+The MetaMorpho timelock is a relationship constraint between the caller and EACH timelocked function. Walk every function in `functions.json` whose `ownerDefinitions` indicate it is a `submit*` function (or anything that historically would have had `func.delay`) and emit one `setEdgeMitigation` rule per `(owner, function)` pair. The standard timelocked functions are:
+
+| Function | Owners |
+|---|---|
+| `submitCap` | `$self.curator`, `$self.owner` |
+| `submitMarketRemoval` | `$self.curator`, `$self.owner` |
+| `submitTimelock` | `$self.owner` |
+| `submitGuardian` | `$self.owner` |
+
+The python snippet below resolves owners from `discovered.json` automatically and is idempotent (replaces any existing rules with the same id), so it's safe to re-run after a re-discovery.
+
+```bash
+VAULT="<chain>:0xVAULT..."   # MetaMorpho vault, ERC-55 checksum
+SLUG="<project-slug>"        # e.g. steakhousev2-usdc
+
+python3 - <<EOF
+import json, os, datetime
+SLUG = "$SLUG"
+VAULT = "$VAULT"
+proj_root = f"packages/config/src/projects/{SLUG}"
+disc = json.load(open(f"{proj_root}/discovered.json"))
+ents = {e["address"].lower(): e for e in disc["entries"]}
+vault_entry = ents.get(VAULT.lower()) or next((e for e in disc["entries"] if e["address"].lower()==VAULT.lower()), None)
+vault_values = (vault_entry or {}).get("values", {}) or {}
+
+def resolve_owner_path(path: str):
+    if not path.startswith("\$self."): return []
+    field = path[len("\$self."):]
+    v = vault_values.get(field)
+    if v is None: return []
+    return v if isinstance(v, list) else [v]
+
+ov_path = f"{proj_root}/call-graph-overrides.json"
+data = json.load(open(ov_path)) if os.path.exists(ov_path) else {"version":"1.0","lastModified":"","rules":[]}
+
+fns = json.load(open(f"{proj_root}/functions.json"))
+# Walk every function with a func.delay → timelock; emit one edge rule per owner
+for cidx, (addr, contract) in enumerate(fns.get("contracts", {}).items()):
+    if addr.lower() != VAULT.lower(): continue
+    for f in contract.get("functions", []):
+        fname = f.get("functionName","")
+        # ANY function whose ownerDefinitions point at curator/owner/guardian is potentially timelocked;
+        # we anchor only those that historically used func.delay (the MetaMorpho submit* family).
+        if not fname.startswith("submit"): continue
+        owners = []
+        for od in (f.get("ownerDefinitions") or []):
+            owners.extend(resolve_owner_path(od.get("path","")))
+        for i, owner in enumerate(dict.fromkeys(owners)):
+            role = (f.get("ownerDefinitions") or [{}])[min(i, len(f.get("ownerDefinitions") or [])-1)].get("path","").replace("\$self.","")
+            rid = f"{SLUG.replace('-','').lower()}-timelock-{fname}-{role}"
+            data["rules"] = [r for r in data["rules"] if r.get("id") != rid]
+            data["rules"].append({
+                "id": rid, "type": "setEdgeMitigation",
+                "from": owner, "to": f"{VAULT}.{fname}",
+                "edgeType": "permission",
+                "mitigations": [{
+                    "type":"delay",
+                    "description": f"7-day MetaMorpho timelock delay before {fname} execution",
+                    "delayRef": {"contractAddress": VAULT, "fieldName":"timelock"},
+                }],
+                "note": f"({role}→{fname}) edge — anchors the MetaMorpho timelock on the relationship, not the function. Prevents the synthetic delay from leaking onto Morpho/Chainlink dependency rows.",
+            })
+
+data["lastModified"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+json.dump(data, open(ov_path,"w"), indent=2)
+print(f"wrote {len(data['rules'])} total rules to {ov_path}")
+EOF
+```
+
+The override engine re-applies these rules on every `buildEnhancedGraph`, so they survive call-graph regeneration. After applying, recompile (`/api/projects/<slug>/compile-review`) and verify in the walker's DetailSidebar that the curator/owner → `submit*` edges show the 🛡 marker, and the Morpho/Chainlink dependency rows no longer carry a 7d delay badge.
 
 ---
 

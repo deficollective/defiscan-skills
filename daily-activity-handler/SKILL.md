@@ -1,18 +1,22 @@
 ---
 name: daily-activity-handler
-description: Daily research routine — find every project with activity today, judge each field change as noise or real protocol/admin change, report everything, then wait for approval before applying anything.
+description: Daily research routine — find every project with activity today, judge each field change as noise or real protocol/admin change, flag analysis follow-up (new contracts, upgrades, removals, admin rotations), report everything, then wait for approval before applying anything.
 ---
 
 # Daily Activity Handler
 
-Walk every project's activity for today, classify each `(contract, field)` change, **report the full picture**, and **wait for the user's approval/feedback** before taking any action.
+Walk every project's activity for today, classify each `(contract, field)` change, **report the full picture** — including any analysis follow-up the change creates — and **wait for the user's approval/feedback** before taking any action.
 
-- **Noise** — field that shouldn't be monitored (counters, supply totals, prices, timestamps, internal accounting, etc.). Proposed action: strip from `activity.json` + add to `ignoreInWatchMode`.
-- **Real change** — protocol or admin change. Write a 1-2 sentence impact summary.
+Ask **two** questions per change:
+
+1. **Noise or real?** (drives the digest + what to strip)
+   - **Noise** — field that shouldn't be monitored (counters, supply totals, prices, timestamps, internal accounting, etc.). Proposed action: strip from `activity.json` + add to `ignoreInWatchMode`.
+   - **Real change** — protocol or admin change. Write a 1-2 sentence impact summary.
+2. **Does it leave an analysis artifact stale or missing?** (drives follow-up) — a new contract with no tag/scoring, an upgrade that orphaned the call graph, a removed contract leaving dangling entries, a Safe/owner rotation that stale-dated a description. See **Step 2.5**. **New contracts are the critical case** — they land in `discovered.json` but are invisible in the compiled review until brought into scope.
 
 Use your judgment. You know DeFi: a `totalSupply` rotating is noise, a new `owner` address is real. When unsure, mark UNCERTAIN — don't try to be clever.
 
-**Apply nothing without explicit user approval.** Steps 1–3 are read-only; Step 4 only runs after the user approves.
+**Apply nothing without explicit user approval.** Steps 1–3 are read-only; Step 4 (noise strips) only runs after the user approves. **Follow-up work is detect-and-recommend only** — the skill surfaces it with the exact command/sub-skill to run; it never tags, regenerates, scores, or edits descriptions on its own. The researcher actions follow-up separately (or asks you to run a specific item).
 
 ## Prerequisites
 
@@ -64,6 +68,76 @@ For deeper taxonomy if you want a sanity check, `/prune-watch-fields` has the fu
 
 ---
 
+## Step 2.5 — Detect follow-up work (read-only)
+
+Step 2 decides noise vs real *for the digest*. This step asks a different question: **does the change leave an analysis artifact stale or missing?** A change can need follow-up whether or not it's digest-worthy. **Detect and recommend only — never execute.** For each follow-up item, name the exact command or sub-skill the researcher should run.
+
+Walk the real events through these triggers:
+
+### `contract-added` — the critical case. Flag EVERY new contract.
+
+A newly discovered contract lands in `discovered.json` but has no `contract-tags.json` entry, no call-graph node, no `functions.json` scoring, and no review-config description — so it's **invisible in the compiled review** until a researcher brings it into scope. Don't skip "obvious" externals or mechanical churn (e.g. AssetLists swapped during an upgrade) — flag them all; the researcher decides. For each new contract, gather:
+
+```bash
+# Identity + verified status + template
+node -e '
+const f = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+const e = f.entries.find(x => x.address.toLowerCase() === process.argv[2].toLowerCase());
+console.log(JSON.stringify({ name: e.name, type: e.type, template: e.template, unverified: e.unverified === true }, null, 2));
+' packages/config/src/projects/<project>/discovered.json <eth:0x...>
+
+# Position in the system: who references it, and does it own/have a role over anything?
+node -e '
+const f = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+const needle = process.argv[2].toLowerCase().replace(/^.*:/, "");
+const refs = [];
+for (const e of f.entries) {
+  if (!e.values) continue;
+  for (const [k, v] of Object.entries(e.values)) {
+    const hit = (x) => typeof x === "string" && x.toLowerCase().includes(needle);
+    if (hit(v)) refs.push(`${e.name}.${k}`);
+    else if (Array.isArray(v)) v.forEach((x, i) => hit(x) && refs.push(`${e.name}.${k}[${i}]`));
+  }
+}
+console.log("Referenced by:", refs.length ? refs.join(", ") : "(nothing — fresh standalone deploy)");
+' packages/config/src/projects/<project>/discovered.json <eth:0x...>
+
+# Tagged already? Holds funds?
+grep -i "<0x...>" packages/config/src/projects/<project>/contract-tags.json
+grep -i "<0x...>" packages/config/src/projects/<project>/funds-data.json
+```
+
+Then recommend a classification + the exact next action:
+
+- **External** (third-party oracle / token / bridge / adapter — other contracts point *into* it, it governs nothing): tag `isExternal` + entity. Run `/run-discovery` (tagging) or tag in the UI; prune as a discovery leaf if it dead-ends.
+- **Governance** (multisig / timelock / DAO module): tag `isGovernance` + entity via `/run-discovery` or the UI.
+- **Internal & verified** (governs protocol contracts, or is reachable as an admin target): tag internal, then **regenerate the call graph**, `/scan-permissions`, `/score-contract` — the full bring-into-scope path.
+- **Holds funds** (appears in `funds-data.json` or is a vault/treasury): enable funds tracking via the funds tags.
+
+### `$implementation` swap
+
+The proxy's `call-graph-data.json` + `functions.json` analyzed the **old** impl. Recommend: regenerate the call graph; if the new impl's ABI function-set differs from the old, also `/scan-permissions` + `/score-contract` on the proxy. Check the ABI diff by comparing the function lists under the old vs new impl address in `discovered.json.entries[proxy].abis[]`.
+
+### `contract-removed`
+
+Stale entries may dangle in `functions.json`, `contract-tags.json`, and `review-config.json` (`admins` / `dependencies`). Recommend deleting them. Find them:
+
+```bash
+for FILE in functions.json contract-tags.json review-config.json; do
+  grep -il "<0x...>" packages/config/src/projects/<project>/$FILE
+done
+```
+
+### Safe `$members` / `$threshold` change
+
+Any `review-config.json` description that quotes the old `N-of-M` is now wrong. Grep descriptions for the Safe address; flag stale `N-of-M` / `N of M` / `N/M` phrases — including **parent** Safes whose description names this Safe as a nested signer. Recommend updating via `/generate-review` or a direct edit.
+
+### `owner` rotation
+
+A `review-config.json` admin entry naming the old owner is now stale. Recommend updating / transferring the description (`/generate-review` or direct edit). If the old owner was *also* `contract-removed` this cycle, the cleanup above already covers deleting its entry.
+
+---
+
 ## Step 3 — Report everything in one go (then STOP)
 
 Process **all** projects with activity today, then emit a single consolidated report. Do not ask anything per-project; do not act yet.
@@ -81,13 +155,20 @@ Use globally-numbered items so the user can refer to anything by number across p
     2. <ContractName> .<field> — <one-line reason>
   UNCERTAIN (k):
     3. <ContractName> .<field> = <value> — <one-line reason>
+  FOLLOW-UP NEEDED (k):
+    4. NEW CONTRACT <Name> (<eth:0x…>) — <verified?>, <position: referenced by X / governs Y / holds $Z / standalone>.
+       → Recommended: <classification + action>. Run: <command or /sub-skill>.
+    5. UPGRADE <Proxy> — call graph + scoring analyzed the old impl.
+       → Run: regenerate call graph; /scan-permissions + /score-contract if the ABI changed.
+    6. STALE DESCRIPTION <Admin/Safe> — review-config quotes "<old N-of-M>", now "<new N-of-M>".
+       → Run: /generate-review or edit the description directly.
 
 <project B>: N events
   ...
 
 ---
 
-Totals: M real, K proposed noise, J uncertain across P projects.
+Totals: M real, K proposed noise, J uncertain, F follow-up across P projects.
 
 Awaiting your call. Examples:
   - "approve" / "go" — apply all proposed NOISE strips, leave UNCERTAIN alone
@@ -95,9 +176,13 @@ Awaiting your call. Examples:
   - "skip 5" — drop item 5 from the strip set
   - "skip <project>" — leave that project untouched
   - "skip all" — apply nothing
+
+FOLLOW-UP items are informational — "approve" does NOT action them. They list the
+exact command/sub-skill for the researcher to run separately. If the user says
+"do 4" or "tag 4 external", run the named sub-skill then; otherwise leave them be.
 ```
 
-**Stop here.** Wait for the user to respond. Do not run Step 4 until they approve. If they ask follow-up questions about specific items, answer from `discovered.json` / `contract-tags.json` / source — don't apply anything yet.
+**Stop here.** Wait for the user to respond. Do not run Step 4 until they approve. Never auto-run a follow-up action — only when the user names it. If they ask follow-up questions about specific items, answer from `discovered.json` / `contract-tags.json` / source — don't apply anything yet.
 
 ---
 
@@ -137,7 +222,7 @@ Don't fabricate. If you'd need to read source to know what a role or parameter d
 
 ## Step 6 — Confirm what was applied
 
-After the strips run, print one short block: which items were stripped, which were skipped per the user's instructions, and a one-line `git status` of `packages/config/src/projects/` so the user sees what to commit.
+After the strips run, print one short block: which items were stripped, which were skipped per the user's instructions, **any FOLLOW-UP items still outstanding** (with their recommended command, so the researcher doesn't lose them), and a one-line `git status` of `packages/config/src/projects/` so the user sees what to commit.
 
 **Recompile every project whose activity you edited.** The strip endpoint already recompiles each project it touches, but trigger an explicit recompile per touched project to be safe (and to cover the manual-edit fallback path):
 
@@ -218,6 +303,8 @@ If the day was 100% noise: emit two lines only — `DeFi Digest — <date>` then
 
 - **Never apply anything before the user approves.** Steps 1–3 are read-only. Step 4 only runs after explicit go.
 - **When uncertain, classify UNCERTAIN.** A noisy alert is annoying; a missed admin change is an incident.
+- **Every new contract gets a FOLLOW-UP item.** A new contract is invisible in the compiled review until tagged + brought into scope — this is the most-missed gap. Never assume an unfamiliar contract is harmless background.
+- **Follow-up is detect-and-recommend only.** Surface the work and the exact command; never tag, regenerate, score, or edit descriptions unless the user names the item.
 - **Group strips by `updateNotifierId`.** One POST per row.
 - **Prefer template edits** when a field is fleet-wide noise across one template.
 - **One sentence beats a paragraph.** The report is meant to be skimmed in 30 seconds.

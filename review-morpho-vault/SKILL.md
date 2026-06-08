@@ -627,6 +627,36 @@ for x in d['dependencies']:
 
 Each feed should show its own cap, not a uniform vault TVS. If they all show the same number, the impactCap fieldRef didn't resolve — common causes: wrong field name, hardcoded shape used instead of the new schema (`{value: "...", unit: "usd"}` is **not** valid; it must be `{value: {mode: "hardcoded", amount: ...}, unit: {kind: "usd"}}` or the fieldRef equivalent).
 
+### 7e. Anchor the 7-day timelock as an EDGE mitigation (NOT a function mitigation)
+
+The MetaMorpho timelock is a **relationship constraint** — it gates the curator's and owner's invocation paths to `submitCap`, not `submitCap` itself. Authoring it as a function-level `mitigations[]` entry causes it to propagate as a spurious "7d delay" badge onto Morpho Blue and Chainlink dependency rows (the dependency view aggregates every function-level mitigation of every reach-function). Anchor it on the two owner permission edges instead — see [SCORING_TABLE.md § Step 7c](SCORING_TABLE.md) for the exact `call-graph-overrides.json` template.
+
+```bash
+VAULT="<chain>:0xVAULT..."
+CURATOR=$(cast call "$VAULT" "curator()(address)" --rpc-url "$RPC")
+OWNER=$(cast call "$VAULT" "owner()(address)"   --rpc-url "$RPC")
+# Then run the python snippet in SCORING_TABLE.md Step 7c with these three values.
+```
+
+After applying, recompile and **verify both expectations hold**:
+1. Curator/owner admin rows still display the 7d delay badge (sourced from the new edge mitigation).
+2. Morpho Blue and Chainlink dependency rows **no longer show** a 7-day delay badge.
+
+```bash
+curl -s "localhost:2021/api/projects/<slug>/dependencies" | python3 -c "
+import json, sys
+deps = json.load(sys.stdin)['dependencies']
+for d in deps:
+    if d.get('entity') not in ('Morpho', 'Chainlink'): continue
+    mits = []
+    for f in d.get('functions', []):
+        for m in (f.get('mitigations') or []):
+            mits.append((m.get('type'), m.get('description','')[:40]))
+    has_delay = any(t == 'delay' for t,_ in mits)
+    print(('  ⚠ STILL HAS DELAY' if has_delay else '  ✓ clean'), d.get('name','?')[:35], d['address'][:18])
+"
+```
+
 ---
 
 ## Step 8: Gather resources

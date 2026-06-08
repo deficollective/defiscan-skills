@@ -70,6 +70,44 @@ Many `require`/`if` checks in permissioned functions are **sanity/invariant guar
 
 Rule of thumb: state the mitigation as *"Because of this constraint, the caller cannot move/drain/dilute more than X"*. If the sentence doesn't finish naturally with a number or a duration, it's not a mitigation — drop it.
 
+#### Anchoring decision — function vs edge (for EVERY mitigation, regardless of type)
+
+Before you write any mitigation entry, decide where it lives. The principle, from [`docs/developers/designs/edge-centric-constraints.md`](../../docs/developers/designs/edge-centric-constraints.md): **anchor a constraint where it originates**. This applies to **every** mitigation type — `delay`, `valueRange`, `relativeValue`, `other` — and to caps. It is not a special case for delays.
+
+Ask one question per constraint: *"Is this bound true for **every** caller of this function, or does it exist **because of who calls**?"*
+
+- **Function-intrinsic** — the bound comes from the function's own body (a `require(value <= MAX)` checked on every call, a `block.timestamp >= lastAction + COOLDOWN` cooldown, a rate limit, a per-call ratio bound). True for every caller, regardless of who. → **Anchor on the function** — emit the entry in `functions.json`'s `mitigations[]` using the JSON shapes in Phase 4.
+
+- **Caller-relationship** — the bound only exists because of a specific caller path: a vault timelock between curator/owner and `submitCap`, a DAO `executionDelay` between an Executor and its targets, a multisig threshold gate that is specific to one owner, a per-caller cap a downstream router enforces only when one specific path is taken. → **Anchor on the edge** — emit a `setEdgeMitigation` rule in `call-graph-overrides.json`, one rule per owner permission edge. The edge IS the scope, so no `scopedTo` is needed on the mitigation itself.
+
+The same applies to **caps**. A function-intrinsic cap (worst-case extraction bounded by observable state from the function's body) belongs in `mitigations[N].impactCap`. A caller-relationship cap (a router/vault that only enforces the cap on one specific upstream path) belongs in a `setEdgeCap` rule on the relevant edge.
+
+##### Edge-mitigation rule shape (any type works)
+
+```jsonc
+// call-graph-overrides.json — one rule per (owner, fn) permission edge
+{
+  "id": "<slug>-<role>-<fn>",
+  "type": "setEdgeMitigation",
+  "from": "<chain>:<ownerAddress>",
+  "to":   "<chain>:<fnContract>.<fnName>",
+  "edgeType": "permission",
+  "mitigations": [
+    /* Same Mitigation object you'd put on a function — any type. Examples: */
+    { "type": "delay", "description": "7-day vault timelock", "delayRef": { "contractAddress": "<vault>", "fieldName": "timelock" } }
+    // OR { "type": "valueRange", "description": "Router only forwards amounts in [1, 14]…", "valueRange": {...} }
+    // OR { "type": "other",      "description": "Veto-only path",                          "label": "Veto-only"          }
+  ],
+  "note": "Brief explanation of why this constraint belongs on the edge."
+}
+```
+
+For the idempotent end-to-end python template (resolves owners from `discovered.json`, writes one rule per `(owner, fn)` pair, safe to re-run), see [`/review-morpho-vault` SCORING_TABLE.md § Step 7c](../review-morpho-vault/SCORING_TABLE.md) — it's a Morpho-vault example but the script is generic.
+
+> ⚠ **The `func.delay` synthesis trap.** Separately from `mitigations[]`, the function entry can carry a top-level `delay: { contractAddress, fieldName }` field. `buildMergedMitigations` reads it and **auto-synthesizes** a global `delay` mitigation that propagates onto every downstream dependency row. For **any caller-relationship timelock** (most timelocks in practice), do NOT set `func.delay` — emit the edge mitigation instead. Setting `func.delay` is appropriate only when the function carries its own enforced cooldown for every caller. See [`permissions.md § Edge-anchored mitigations & impact caps`](../../docs/developers/features/permissions.md) for the leak mechanism we hunted down across 5 Morpho-vault projects in 2026-06.
+
+> 💬 **If you're unsure**, report the constraint to the user with both anchoring options and the evidence each way — don't guess. Mis-anchoring is silent: a caller-relationship constraint mis-anchored on the function shows up only as a wrong badge on a dependency row that no one notices until much later.
+
 #### Calibration: when the function looks "future-only" but isn't
 
 The single most common scoring error is calling a state-flag setter `future-only` when the flag is actually checked on a user-exit path. **Don't trust the flag's name** — protocols use `paused` / `frozen` / `halted` / `stopped` / `locked` / `inactive` / `disabled` interchangeably and sometimes invertedly. The only reliable signal is the flag's read sites. Grep the flag across the protocol's `validate*` / `_check*` / inline-`require` paths and classify by what's blocked:
@@ -187,7 +225,7 @@ Use the most specific mode available:
 }
 ```
 
-**`delay`** — for timelock or cooldown constraints:
+**`delay`** — for timelock or cooldown constraints (apply only after Phase 2's anchoring decision says "function-intrinsic"; for caller-relationship timelocks, emit a `setEdgeMitigation` rule per the Phase 2 guidance instead):
 ```json
 {
   "type": "delay",

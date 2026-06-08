@@ -146,6 +146,12 @@ curl -sN "localhost:2021/api/terminal/generate-call-graph?project=$0&devMode=fal
 
 If the rerun takes more than a couple of minutes, it isn't actually hitting the cache — investigate before proceeding.
 
+### Multi-instance protocol check (skip if there's only one of each contract)
+
+If the protocol has **N parallel instances sharing one implementation template** — e.g. Liquity v2's 3 collateral markets (one TroveManager/BorrowerOperations/ActivePool/SortedTroves per market), a MetaMorpho factory's per-curator vaults, parallel deployment patterns — Slither's optimistic resolution will pick one of N candidates per multi-candidate edge and get it wrong ~⅔ of the time. The fix is **`setOutgoingTarget`** bulk rules in `call-graph-overrides.json`, not the atomic `addEdge` + `removeEdge` pairs the audit-callgraph skill would propose.
+
+One bulk rule replaces tens to hundreds of atomic ones, with the same edge-set semantics. Concrete numbers from the **liquity-v2 audit (2026-06)**: 267 distinct edge corrections became 534 atomic rules → collapsed to **17 bulk `setOutgoingTarget` rules** (~31×) once we recognized the multi-instance pattern. See [`docs/developers/features/call-graph-analysis.md`](../../docs/developers/features/call-graph-analysis.md) for the rule shape (with optional `calledFunction` filter for selector-collision cases). Use the python helper pattern at the top of the liquity overrides file as a template if the protocol falls into this category.
+
 Then refresh funds-data so Step 7's scoring sees correct USD values. Step 3 already established the baseline — this refresh just picks up any contract tags or aggregate-handler changes that landed mid-pipeline:
 
 ```bash

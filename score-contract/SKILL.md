@@ -305,9 +305,31 @@ Confirm `tokenInfo` is present in `funds-data.json`. If the DeFiScan endpoints s
 
 ---
 
-### Phase 3b: Mitigation placement (three rules, stated once)
+### Phase 3b: Mitigation placement
 
-Get this wrong and the cap either doesn't propagate or over-propagates. Three distinct placements, all needed for different views:
+Get this wrong and the cap either doesn't propagate or over-propagates. **Two anchoring options, four placement rules.** The first decision is structural; the placement rules apply conditionally based on it.
+
+---
+
+#### Step 0 — Anchoring decision (do this for EVERY mitigation and cap, regardless of type)
+
+The principle, from [`docs/developers/designs/edge-centric-constraints.md`](../../docs/developers/designs/edge-centric-constraints.md): **anchor a constraint where it originates**. This applies to **every** mitigation type (`delay`, `valueRange`, `relativeValue`, `other`) and to caps.
+
+Ask: *"Is this bound true for **every** caller of this function, or does it exist **because of who calls**?"*
+
+- **Function-intrinsic** — bound comes from the function's body (`require(value <= MAX)`, on-chain cooldown checked on every call, a cap derived from observable state of the function's own contract). True for every caller. → **Anchor on the function**. Apply placement rules 1 / 2 below.
+
+- **Caller-relationship** — bound only exists because of a specific caller's path: a vault timelock between curator/owner and `submitCap`, a DAO `executionDelay` between an Executor and its targets, a per-caller cap a downstream router enforces only on one path, a multisig threshold gate specific to one owner. → **Anchor on the edge**. Apply placement rule 4 below.
+
+The same applies to **caps**. A function-intrinsic cap (worst case bounded by observable state, regardless of caller) → `mitigations[N].impactCap` on the function. A caller-relationship cap (only enforced because of who calls) → `setEdgeCap` rule on the edge.
+
+The two anchors compose at compute time — the merge in `getMitigationsForOwner` collects function mits plus edge mits and de-dupes through the shared `mitigationDedupKey` — so there's no double-counting. But mis-anchoring (caller-relationship constraint on the function) silently propagates the bound onto every downstream dependency row, even if you add `scopedTo`. The historic `scopedTo: { type: "admin" }` pattern (rule 3 below) is **legacy** for new authoring of caller-relationship constraints: prefer edge anchoring where the dedup model already handles per-owner display correctly.
+
+> ⚠ **The `func.delay` synthesis trap.** Separately from `mitigations[]`, the function entry can carry a top-level `delay: { contractAddress, fieldName }` field. `buildMergedMitigations` reads it and **auto-synthesizes** a global `delay` mitigation that propagates onto every downstream dependency row as a spurious badge. For **any caller-relationship timelock** (most timelocks in practice), do NOT set `func.delay` — emit the edge mitigation per rule 4. Setting `func.delay` is appropriate only when the function carries its own enforced cooldown for every caller (rare). The Morpho-vault leak we hunted down across 5 projects in 2026-06 was this exact trap; see [`permissions.md § Edge-anchored mitigations & impact caps`](../../docs/developers/features/permissions.md).
+
+---
+
+#### Function-anchored placement (rules 1–3, apply when Step 0 says "function-intrinsic")
 
 **1. Global leaf cap** — on the *called* function of the external dependency, no `scopedTo`.
 Example: `LRTOracle.getAssetPrice` or `LRTOracle.rsETHPrice`.
@@ -332,13 +354,60 @@ Do NOT apply this to every function the dependency analysis *lists* — only to 
 **3. Scoped-to-admin self-cap** — on functions the admin directly calls, with `scopedTo: { address: <adminAddress>, type: "admin" }`.
 Use this to attach upstream timelock or multi-path-gated mitigations (e.g. "all actions via DSPauseProxy are subject to a 1-day DSPause timelock"). Same direct-callee rule applies — put the mit on each function the admin directly owns.
 
-**Caller-specific mitigations need `scopedTo`; function-level bounds must stay un-scoped.** Many functions are reachable through more than one admin path — typically a slow governance pipeline (DAO + timelock) AND a fast multisig path (emergency guardian, risk council, gnosis safe with the same role). A "vote + execution delay" mitigation is true only for the timelock caller; the multisig calls directly with no delay. **Always `scopedTo: { address: <timelock-or-executor>, type: "admin" }`** when the bound applies to one specific caller. A global (un-scoped) governance-pipeline delay falsely shows on every other admin that holds the same role and misleads readers about that admin's real authority.
+**Caller-specific mitigations need scoping; function-level bounds must stay un-scoped.** Many functions are reachable through more than one admin path — typically a slow governance pipeline (DAO + timelock) AND a fast multisig path (emergency guardian, risk council, gnosis safe with the same role). A "vote + execution delay" mitigation is true only for the timelock caller; the multisig calls directly with no delay. The constraint *must* be expressed per-caller. Two ways to do that:
+- **Legacy (rule 3)**: `scopedTo: { address: <timelock-or-executor>, type: "admin" }` on the function mitigation. Still works; existing data is not migrated.
+- **Principled new (rule 4)**: `setEdgeMitigation` on the owner→function permission edge. The edge IS the scope; no `scopedTo` needed; the dedup model prevents per-owner display issues. **Prefer this for new authoring.**
+
+A global (un-scoped) caller-specific bound falsely shows on every other admin that holds the same role and misleads readers about that admin's real authority — regardless of which anchoring you choose.
 
 The opposite mistake is just as bad. A *function-level* bound (impactCap from observable state, pause-window scope, value-range max from a require) applies to every caller and **must stay un-scoped** — adding `scopedTo` there hides the cap from admins it should apply to. *Concrete instance from 2026-05:* an emergency-pause function's `pause-bound` cap had been scoped to the timelock caller only; the emergency multisig (the actual fast caller of the function) saw no cap and only a misleading transitive `future-only` mitigation propagated up from a downstream view function — until the scope was removed.
 
-Decide consciously per mitigation: is the bound a property of *who calls* (delay, sequencer-confirmation requirement, vote-threshold) or a property of *the function itself* (numeric cap, locked-window, value-range)? Caller-bound → scope. Function-bound → don't scope.
+Decide consciously per mitigation per Step 0: is the bound a property of *who calls* (delay, sequencer-confirmation requirement, vote-threshold, per-caller cap) or a property of *the function itself* (numeric cap, locked-window, value-range)? Caller-relationship → edge anchor (rule 4) or scoped function mit (legacy rule 3). Function-intrinsic → un-scoped function mit (rules 1/2).
 
-**Upgrade functions (`upgradeTo`, `upgradeToAndCall`) are special.** They have no outgoing call-graph edges themselves but semantically grant the full impl reach. The engine now seeds upgrade-function BFS with every caller function on the contract, so a cap on the leaf or on a direct caller of the dependency propagates correctly into upgrade-function views. Just place your caps correctly per rule 1/2/3 — the engine handles the rest.
+---
+
+#### Edge-anchored placement (rule 4, apply when Step 0 says "caller-relationship")
+
+**4. Edge-anchored mitigation or cap on the owner→function permission edge.** This works for **any** mitigation type (`delay`, `valueRange`, `relativeValue`, `other`) and for `impactCap`. The edge IS the scope — no `scopedTo` is needed on the mitigation.
+
+For each owner of the function (one rule per `(owner, fn)` permission edge), emit into `call-graph-overrides.json`:
+
+```jsonc
+// Mitigation on an owner→fn edge
+{
+  "id": "<slug>-<role>-<fn>",
+  "type": "setEdgeMitigation",
+  "from": "<chain>:<ownerAddress>",
+  "to":   "<chain>:<fnContract>.<fnName>",
+  "edgeType": "permission",
+  "mitigations": [ /* any Mitigation object — same shape as functions.json mitigations[N] */ ],
+  "note": "Why this constraint belongs on the edge"
+}
+
+// Cap on an owner→fn edge (impact cap; relationship-anchored, NOT function-intrinsic)
+{
+  "id": "<slug>-<role>-<fn>-cap",
+  "type": "setEdgeCap",
+  "from": "<chain>:<ownerAddress>",
+  "to":   "<chain>:<fnContract>.<fnName>",
+  "edgeType": "permission",
+  "cap": { "value": { "mode": "fieldRef", "contractAddress": "<addr>", "fieldName": "..." }, "unit": { "kind": "..." } }
+}
+```
+
+For the idempotent end-to-end python template that resolves owners from `discovered.json` and emits one rule per `(owner, fn)` pair (safe to re-run), see [`/review-morpho-vault` SCORING_TABLE.md § Step 7c](../review-morpho-vault/SCORING_TABLE.md) — it's a Morpho-vault example but the script is generic.
+
+**When edge anchoring is the right choice — concrete shapes:**
+- **DAO governance pipeline timelock** (e.g. `Executor.execute` is gated by a vote+timelock chain). Author the delay as `setEdgeMitigation` on the (DAO/Executor → target.fn) edge, not as a global mit on every owned function.
+- **Per-caller cap a downstream router enforces** (e.g. only one specific upstream owner triggers the capped path; other owners bypass it). `setEdgeCap` on the relevant owner→fn permission edge.
+- **Multi-path admin where one path is fast and another is slow** (vote+timelock vs emergency multisig). Edge-anchor the slow path's delay on the timelock's edge; the fast path's edge stays uncapped. Replaces the legacy `scopedTo: { type: "admin" }` approach (rule 3) with the principled new pattern.
+- **Veto-only or role-restricted constraints** (`type: "other"` with a `label`) that only apply to one specific owner. Anchor on that owner's edge.
+
+> Rule 3's `scopedTo: { type: "admin" }` is the **legacy** way to express most of these. It still works and existing data is not migrated. For **new** authoring of caller-relationship constraints, prefer rule 4 — the dedup model handles per-owner display correctly without leaking onto dependency rows.
+
+---
+
+**Upgrade functions (`upgradeTo`, `upgradeToAndCall`) are special.** They have no outgoing call-graph edges themselves but semantically grant the full impl reach. The engine now seeds upgrade-function BFS with every caller function on the contract, so a cap on the leaf or on a direct caller of the dependency propagates correctly into upgrade-function views. Just place your caps correctly per rules 1–4 — the engine handles the rest.
 
 ---
 
@@ -361,7 +430,17 @@ setRedistributor  (critical, $12.4M reachable, asset-bounded):
 Pool.borrow  (critical, direct Kelp caller):
   mit: [other / bounded-by-spark-rsETH-pool]  scopedTo: { LRTOracle, dependency }
   cap: fieldRef LRTOracle.sparkRsETHPoolBalance (unit: token rsETH)
-  placement: direct Kelp caller per call-graph (resolvedAddress == LRTOracle)
+  placement: rule 2 — direct Kelp caller per call-graph (resolvedAddress == LRTOracle)
+
+Executor.execute  (critical, caller-relationship timelock):
+  mit: [delay / 7d]  via edge mitigation on (DAO → Executor.execute | permission)
+  cap: none (relationship constraint; no value bound)
+  placement: rule 4 — setEdgeMitigation in call-graph-overrides.json; NO func.delay on the function
+
+vault.submitCap  (unscored, caller-relationship timelock × 2 owners):
+  mit: [delay / 7d]  via edge mitigations on (curator → vault.submitCap) AND (owner → vault.submitCap)
+  cap: none
+  placement: rule 4 — two setEdgeMitigation rules; see /review-morpho-vault SCORING_TABLE.md § Step 7c template
 ```
 
 **Wait for explicit user confirmation before proceeding.** If a new handler or tokenInfo seeding is needed, list those as separate actions to confirm.
